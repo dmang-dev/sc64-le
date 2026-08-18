@@ -19,7 +19,7 @@ maps; `.gitignore` blocks every ROM and map extension outright.
 git clone https://github.com/dmang-dev/sc64-maps      # the read side
 git clone https://github.com/dmang-dev/sc64-le
 cd sc64-le
-pip install bolt-lzss                                 # 0.2.0 or later
+pip install bolt-lzss Pillow                          # bolt-lzss 0.2.0 or later
 
 python ladder_edition.py --expand --recursive \
     --maps /path/to/StarCraft/Maps/ladder \
@@ -53,6 +53,7 @@ round-trip through their own decoder and hang the console.
 | `ladder_edition.py` | install PC ladder maps into the melee slots and repoint the lists |
 | `inject_map.py` | put one PC map into a BOLT slot, raw or compressed |
 | `patch_scenario.py` | read or edit the melee Scenario list |
+| `loading_screen.py` | replace the "ACCESSING MISSION DATA..." screens with your own art |
 | `title_brand.py` | stamp text onto the title screen |
 | `n64crc.py` | detect and repair the N64 boot checksum |
 | `pc_maps.py` | read a PC `.scm`/`.scx`, protected ones included |
