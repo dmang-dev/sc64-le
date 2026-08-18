@@ -325,6 +325,98 @@ class Emu:
     def loadstate(self, path):
         return self.cmd("LOADSTATE", str(Path(path).resolve()))
 
+    # ------------------------------------------------------ instrumentation
+    #
+    # Watchpoints need the Mupen64Plus core. Ares64 accepts the registration,
+    # hands back an all-zero hook id and then never calls back -- so a watch
+    # on it reports "nothing touched this address", which is indistinguishable
+    # from a real result. The Lua rejects the null id rather than let that
+    # through, and Emu(core="Mupen64Plus") is what you want for any run that
+    # uses these.
+
+    def watch(self, addr: int, kind: str = "read",
+              scope: str = "System Bus",
+              snap_addr: int | None = None, snap_len: int = 256) -> str:
+        """Record the PC of every access to `addr`.
+
+        Aggregated by PC on the Lua side: the question is which code touches
+        the address, and a per-hit log of a word the engine reads every frame
+        is a great deal of the same three addresses.
+        """
+        args = [addr, kind, scope]
+        if snap_addr is not None:
+            args += [snap_addr, snap_len]
+        return self.cmd("WATCH", *args).strip()
+
+    def snap_dump(self) -> dict:
+        """{key: (frame, pc, addr, bytes)} captured when each watch first fired.
+
+        Captured inside the callback on purpose: overlay code is resident only
+        while it runs, so reading those addresses afterwards disassembles
+        whatever replaced it.
+        """
+        out = {}
+        for line in self.cmd("SNAPDUMP").splitlines():
+            if not line.strip() or line.strip() == "none":
+                continue
+            key, frame, pc, addr, regs, hexs = line.split("\t")
+            rd = {}
+            for pair in (regs.split(',') if regs else []):
+                rk, _, rv = pair.partition('=')
+                rd[rk] = int(rv, 16)
+            out[key] = {'frame': int(frame), 'pc': int(pc, 16),
+                        'addr': int(addr, 16), 'regs': rd,
+                        'data': bytes.fromhex(hexs)}
+        return out
+
+    def watch_dump(self, top: int = 64) -> dict:
+        """{'total_hits': int, 'truncated': bool, 'watches': {key: [rows]}}.
+
+        Each row is (pc, hits, first_frame, last_frame).
+        """
+        out = {"total_hits": 0, "truncated": False, "watches": {}}
+        cur = None
+        for line in self.cmd("WATCHDUMP", top).splitlines():
+            if line.startswith("total_hits="):
+                out["total_hits"] = int(line.partition("=")[2])
+            elif line.startswith("truncated="):
+                out["truncated"] = line.partition("=")[2].strip() == "true"
+            elif line.startswith("watch="):
+                cur = line.partition("=")[2].split()[0]
+                out["watches"][cur] = []
+            elif line.strip() and cur:
+                pc, n, first, last = line.split()
+                out["watches"][cur].append(
+                    (int(pc, 16), int(n), int(first), int(last)))
+        return out
+
+    def watch_clear(self) -> int:
+        return int(self.cmd("WATCHCLEAR").strip())
+
+    def trace(self, frames: int = 120) -> int:
+        """Sample the PC once per frame for `frames` frames.
+
+        Coarse next to a watchpoint -- one sample a frame catches only what
+        the CPU is doing at the moment the Lua loop runs -- but it needs
+        nothing except a readable PC, so it still reports on a core whose
+        memory callbacks are inert, and it still separates a wedged loop from
+        one that is making progress.
+        """
+        return int(self.cmd("TRACE", frames, timeout=30.0 + frames * 0.5))
+
+    def trace_dump(self, top: int = 40) -> dict:
+        """{'samples': int, 'distinct_pcs': int, 'top': [(pc, hits), ...]}."""
+        out = {"samples": 0, "distinct_pcs": 0, "top": []}
+        for line in self.cmd("TRACEDUMP", top).splitlines():
+            if line.startswith("samples="):
+                out["samples"] = int(line.partition("=")[2])
+            elif line.startswith("distinct_pcs="):
+                out["distinct_pcs"] = int(line.partition("=")[2])
+            elif line.strip():
+                pc, n = line.split()
+                out["top"].append((int(pc, 16), int(n)))
+        return out
+
     # ------------------------------------------------------------ health
 
     def is_alive(self) -> bool:

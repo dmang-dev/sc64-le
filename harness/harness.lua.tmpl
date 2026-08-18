@@ -12,6 +12,8 @@
 -- Response body: OK \n payload      |  ERR \n message
 
 local DIR = [[@@DIR@@]]
+local NL = string.char(10)
+local TAB = string.char(9)
 
 local seq = 1                 -- next request number we expect
 local target_frame = nil      -- set by FRAMES; loop runs until reached
@@ -217,6 +219,241 @@ handlers.API = function(a)
     return true, table.concat(out, "\n")
 end
 
+handlers.CAPS = function()
+    local NL = string.char(10)
+    local out = {}
+    local function add(k, v) out[#out + 1] = k .. "=" .. tostring(v) end
+
+    -- Report the type but never BRANCH on it. NLua exposes .NET methods as
+    -- userdata, so testing for "function" here silently disables the probe.
+    for _, n in ipairs({ "onmemoryread", "onmemorywrite", "onmemoryexecute",
+                         "onframestart", "onframeend", "unregisterbyid",
+                         "availableScopes" }) do
+        local ok, v = pcall(function() return event[n] end)
+        add("event." .. n, ok and type(v) or "absent")
+    end
+
+    -- Which scope strings does THIS core accept? A callback registered
+    -- against a scope the core does not publish is silently inert rather
+    -- than an error, which is the worst failure mode for an instrument.
+    local ok, sc = pcall(function() return event.availableScopes() end)
+    if ok and type(sc) == "table" then
+        local names = {}
+        for _, v in pairs(sc) do names[#names + 1] = tostring(v) end
+        table.sort(names)
+        add("scopes", table.concat(names, ","))
+    else
+        add("scopes", "unavailable: " .. tostring(sc))
+    end
+
+    -- Registering is not the same as firing. Hook reads, run frames, count.
+    local hits = 0
+    local id = nil
+    local rok, rid = pcall(function()
+        return event.onmemoryread(function() hits = hits + 1 end,
+                                  nil, "capsprobe", "System Bus")
+    end)
+    add("register_systembus", rok and ("ok id=" .. tostring(rid))
+                                  or ("failed: " .. tostring(rid)))
+    if rok then id = rid end
+    for _ = 1, 3 do emu.frameadvance() end
+    add("read_hits_3_frames", hits)
+    if id then pcall(function() event.unregisterbyid(id) end) end
+
+    -- Same again with no scope argument, in case the default scope is the
+    -- one that works on this core.
+    local hits2 = 0
+    local rok2, rid2 = pcall(function()
+        return event.onmemoryread(function() hits2 = hits2 + 1 end,
+                                  nil, "capsprobe2")
+    end)
+    add("register_default", rok2 and ("ok id=" .. tostring(rid2))
+                                 or ("failed: " .. tostring(rid2)))
+    for _ = 1, 3 do emu.frameadvance() end
+    add("read_hits_default", hits2)
+    if rok2 then pcall(function() event.unregisterbyid(rid2) end) end
+
+    -- And an execute hook, which is what a real breakpoint needs.
+    local xhits = 0
+    local xok, xid = pcall(function()
+        return event.onmemoryexecute(function() xhits = xhits + 1 end,
+                                     nil, "capsprobe3")
+    end)
+    add("register_exec", xok and ("ok id=" .. tostring(xid))
+                             or ("failed: " .. tostring(xid)))
+    for _ = 1, 3 do emu.frameadvance() end
+    add("exec_hits", xhits)
+    if xok then pcall(function() event.unregisterbyid(xid) end) end
+
+    return true, table.concat(out, NL)
+end
+
+-- ------------------------------------------------------------ watchpoints
+--
+-- Registered hooks, and hits aggregated as key -> pc -> {n, first, last}.
+-- Aggregating in Lua rather than shipping every hit to Python keeps a watch on
+-- a hot address from turning into a hundred megabytes of duplicate lines.
+local watch_ids = {}
+local snaps = {}
+local watch_log = {}
+local watch_hits = 0
+local WATCH_MAX = 2000000        -- stop recording, keep counting, past this
+
+local function watch_record(key, pc, frame)
+    watch_hits = watch_hits + 1
+    if watch_hits > WATCH_MAX then return end
+    local t = watch_log[key]
+    if not t then t = {} watch_log[key] = t end
+    local e = t[pc]
+    if e then
+        e.n = e.n + 1
+        e.last = frame
+    else
+        t[pc] = { n = 1, first = frame, last = frame }
+    end
+end
+
+-- A core with no callback support ACCEPTS the registration and hands back an
+-- all-zero GUID, then never fires. That is the single most dangerous failure
+-- mode here -- it looks exactly like "nothing touched this address" -- so it
+-- is turned into a hard error at registration time.
+local function is_null_id(id)
+    local s = tostring(id):gsub("[-0]", "")
+    return s == ""
+end
+
+handlers.WATCH = function(a)
+    local addr = tonumber(a[1])
+    local kind = (a[2] or "read"):lower()
+    local scope = a[3] or "System Bus"
+    local snap_addr = tonumber(a[4])
+    local snap_len = tonumber(a[5]) or 256
+    if not addr then
+        return false, "WATCH addr [read|write|exec] [scope] [snap_addr] [snap_len]"
+    end
+    local reg = ({ read = event.onmemoryread,
+                   write = event.onmemorywrite,
+                   exec = event.onmemoryexecute })[kind]
+    if not reg then return false, "kind must be read, write or exec" end
+
+    local key = kind .. ":" .. string.format("0x%08X", addr)
+    local fn = function()
+        watch_record(key, get_pc() or -1, emu.framecount())
+        -- Photograph memory the first time only. Overlay code is resident
+        -- only while it runs, so a later read gets whatever replaced it.
+        if not snaps[key] then
+            -- ra is the whole point: at an execute breakpoint it names the
+            -- caller outright, which no amount of static scanning has managed.
+            local regs = {}
+            for _, rn in ipairs({ "ra", "a0", "a1", "a2", "a3",
+                                  "v0", "v1", "s0", "s1", "sp" }) do
+                -- Mupen64Plus splits each 64-bit GPR into
+                -- <name>_hi / <name>_lo; Ares64 uses the bare name.
+                local rv = safe_reg(rn .. "_lo")
+                if rv == nil then rv = safe_reg(rn) end
+                if rv ~= nil then
+                    regs[#regs + 1] = rn .. "="
+                        .. string.format("0x%08X", math.floor(rv) % 0x100000000)
+                end
+            end
+            snaps[key] = { frame = emu.framecount(), pc = get_pc() or -1,
+                           addr = snap_addr or 0, hex = "",
+                           regs = table.concat(regs, ",") }
+        end
+        if snap_addr and snaps[key] and snaps[key].hex == "" then
+            local base = snap_addr
+            if base >= 0x80000000 then base = base - 0x80000000 end
+            local parts = {}
+            for i = 0, snap_len - 1 do
+                parts[#parts + 1] = tohex(memory.read_u8(base + i, "RDRAM"))
+            end
+            snaps[key].hex = table.concat(parts)
+        end
+    end
+    local ok, id = pcall(function() return reg(fn, addr, key, scope) end)
+    if not ok then return false, "register failed: " .. tostring(id) end
+    if is_null_id(id) then
+        return false, "core returned a null hook id -- this core does not "
+            .. "implement memory callbacks; boot with core=Mupen64Plus"
+    end
+    watch_ids[#watch_ids + 1] = id
+    return true, key .. " id=" .. tostring(id)
+end
+
+handlers.WATCHDUMP = function(a)
+    local top = tonumber(a[1]) or 64
+    local out = {}
+    out[#out + 1] = "total_hits=" .. watch_hits
+    out[#out + 1] = "truncated=" .. tostring(watch_hits > WATCH_MAX)
+    for key, t in pairs(watch_log) do
+        local rows = {}
+        for pc, e in pairs(t) do
+            rows[#rows + 1] = { pc = pc, n = e.n, first = e.first, last = e.last }
+        end
+        table.sort(rows, function(x, y) return x.n > y.n end)
+        out[#out + 1] = "watch=" .. key .. " distinct_pcs=" .. #rows
+        for i = 1, math.min(#rows, top) do
+            local r = rows[i]
+            out[#out + 1] = "  " .. string.format("0x%08X", r.pc)
+                .. TAB .. r.n .. TAB .. r.first .. TAB .. r.last
+        end
+    end
+    return true, table.concat(out, NL)
+end
+
+handlers.SNAPDUMP = function()
+    local out = {}
+    for key, s in pairs(snaps) do
+        out[#out + 1] = key .. TAB .. s.frame .. TAB
+            .. string.format("0x%08X", s.pc) .. TAB
+            .. string.format("0x%08X", s.addr) .. TAB
+            .. (s.regs or "") .. TAB .. s.hex
+    end
+    if #out == 0 then out[#out + 1] = "none" end
+    return true, table.concat(out, NL)
+end
+
+handlers.WATCHCLEAR = function()
+    local n = #watch_ids
+    for _, id in ipairs(watch_ids) do
+        pcall(function() event.unregisterbyid(id) end)
+    end
+    watch_ids = {}
+    watch_log = {}
+    snaps = {}
+    watch_hits = 0
+    return true, tostring(n)
+end
+
+-- ------------------------------------------------------------ pc trace
+
+local trace_left = 0
+local trace_log = {}
+local trace_samples = 0
+
+handlers.TRACE = function(a, s)
+    local n = tonumber(a[1]) or 60
+    trace_log = {}
+    trace_samples = 0
+    trace_left = n
+    target_frame = emu.framecount() + n
+    pending_seq = s
+    return nil                      -- replies when the frames have run
+end
+
+handlers.TRACEDUMP = function(a)
+    local top = tonumber(a[1]) or 40
+    local rows = {}
+    for pc, n in pairs(trace_log) do rows[#rows + 1] = { pc = pc, n = n } end
+    table.sort(rows, function(x, y) return x.n > y.n end)
+    local out = { "samples=" .. trace_samples, "distinct_pcs=" .. #rows }
+    for i = 1, math.min(#rows, top) do
+        out[#out + 1] = "  " .. string.format("0x%08X", rows[i].pc)
+            .. TAB .. rows[i].n
+    end
+    return true, table.concat(out, NL)
+end
+
 handlers.SAVESTATE = function(a)
     if not a[1] then return false, "SAVESTATE path" end
     savestate.save(a[1])
@@ -292,6 +529,13 @@ while true do
         local s = pending_seq
         target_frame, pending_seq, hold_until, hold_btns = nil, nil, nil, nil
         if s then reply(s, true, tostring(emu.framecount())) end
+    end
+
+    if trace_left > 0 then
+        local p = get_pc() or -1
+        trace_log[p] = (trace_log[p] or 0) + 1
+        trace_samples = trace_samples + 1
+        trace_left = trace_left - 1
     end
 
     hb = hb + 1
