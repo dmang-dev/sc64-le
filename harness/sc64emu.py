@@ -366,7 +366,9 @@ class Emu:
                 rd[rk] = int(rv, 16)
             out[key] = {'frame': int(frame), 'pc': int(pc, 16),
                         'addr': int(addr, 16), 'regs': rd,
-                        'data': bytes.fromhex(hexs)}
+                        'data': (b'' if hexs.startswith('ERR:')
+                                 else bytes.fromhex(hexs)),
+                        'error': hexs[4:] if hexs.startswith('ERR:') else None}
         return out
 
     def watch_dump(self, top: int = 64) -> dict:

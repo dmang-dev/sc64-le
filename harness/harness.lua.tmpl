@@ -363,11 +363,23 @@ handlers.WATCH = function(a)
         if snap_addr and snaps[key] and snaps[key].hex == "" then
             local base = snap_addr
             if base >= 0x80000000 then base = base - 0x80000000 end
-            local parts = {}
-            for i = 0, snap_len - 1 do
-                parts[#parts + 1] = tohex(memory.read_u8(base + i, "RDRAM"))
+            -- Reading memory inside a memory callback can be refused or
+            -- can re-enter, so this must never fail quietly: an empty
+            -- snapshot would look like an address holding nothing,
+            -- rather than one that was never captured -- the exact
+            -- silent failure this tool exists to avoid.
+            local ok, res = pcall(function()
+                local parts = {}
+                for i = 0, snap_len - 1 do
+                    parts[#parts + 1] = tohex(memory.read_u8(base + i, "RDRAM"))
+                end
+                return table.concat(parts)
+            end)
+            if ok then
+                snaps[key].hex = res
+            else
+                snaps[key].err = tostring(res)
             end
-            snaps[key].hex = table.concat(parts)
         end
     end
     local ok, id = pcall(function() return reg(fn, addr, key, scope) end)
@@ -407,7 +419,8 @@ handlers.SNAPDUMP = function()
         out[#out + 1] = key .. TAB .. s.frame .. TAB
             .. string.format("0x%08X", s.pc) .. TAB
             .. string.format("0x%08X", s.addr) .. TAB
-            .. (s.regs or "") .. TAB .. s.hex
+            .. (s.regs or "") .. TAB
+            .. ((s.hex ~= "") and s.hex or ("ERR:" .. (s.err or "not captured")))
     end
     if #out == 0 then out[#out + 1] = "none" end
     return true, table.concat(out, NL)
