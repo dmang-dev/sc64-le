@@ -374,7 +374,11 @@ class Emu:
     def watch_dump(self, top: int = 64) -> dict:
         """{'total_hits': int, 'truncated': bool, 'watches': {key: [rows]}}.
 
-        Each row is (pc, hits, first_frame, last_frame).
+        Each row is a dict: pc, overlay, hits, first, last.
+
+        Rows are keyed by (pc, overlay), not pc alone. An address in an
+        overlay window hosts different code at different times, so merging
+        on the address silently adds together unrelated functions.
         """
         out = {"total_hits": 0, "truncated": False, "watches": {}}
         cur = None
@@ -387,10 +391,27 @@ class Emu:
                 cur = line.partition("=")[2].split()[0]
                 out["watches"][cur] = []
             elif line.strip() and cur:
-                pc, n, first, last = line.split()
+                pc, sig, n, first, last = line.split()
                 out["watches"][cur].append(
-                    (int(pc, 16), int(n), int(first), int(last)))
+                    {"pc": int(pc, 16), "overlay": sig, "hits": int(n),
+                     "first": int(first), "last": int(last)})
         return out
+
+    def sig_set(self, addr: int, words: int = 8) -> str:
+        """Sample `words` words at `addr` as the resident overlay's identity.
+
+        Point this at a fixed anchor inside the overlay window being studied.
+        Every subsequent watch hit is tagged with it, so hits at one address
+        under two different resident images stay separate.
+        """
+        return self.cmd("SIGSET", addr, words).strip()
+
+    def sig_clear(self) -> str:
+        return self.cmd("SIGCLEAR").strip()
+
+    def sig(self) -> str:
+        """The signature right now, or '-' if unset, 'ERR' if unreadable."""
+        return self.cmd("SIG").strip()
 
     def watch_clear(self) -> int:
         return int(self.cmd("WATCHCLEAR").strip())

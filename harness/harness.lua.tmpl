@@ -299,17 +299,48 @@ local watch_log = {}
 local watch_hits = 0
 local WATCH_MAX = 2000000        -- stop recording, keep counting, past this
 
+-- Anchor for the overlay signature. nil means "not configured", and every
+-- row then reports "-" rather than a fake identity.
+local sig_addr = nil
+local sig_words = 8
+
+local function overlay_sig()
+    if not sig_addr then return nil end
+    local base = sig_addr
+    if base >= 0x80000000 then base = base - 0x80000000 end
+    local ok, acc = pcall(function()
+        local h = 0
+        for i = 0, sig_words - 1 do
+            local w = memory.read_u32_be(base + i * 4, "RDRAM")
+            h = (h * 31 + w) % 4294967296
+        end
+        return h
+    end)
+    if ok then return acc end
+    return false                      -- distinct from any real signature
+end
+
+local function sig_label(sig)
+    if sig == nil then return "-" end
+    if sig == false then return "ERR" end
+    return string.format("%08X", sig)
+end
+
 local function watch_record(key, pc, frame)
     watch_hits = watch_hits + 1
     if watch_hits > WATCH_MAX then return end
     local t = watch_log[key]
     if not t then t = {} watch_log[key] = t end
-    local e = t[pc]
+    -- Aggregate by (pc, overlay), not pc: the same address under two
+    -- different resident images is two different functions.
+    local sig = sig_label(overlay_sig())
+    local slot = string.format("%08X:%s", pc % 0x100000000, sig)
+    local e = t[slot]
     if e then
         e.n = e.n + 1
         e.last = frame
     else
-        t[pc] = { n = 1, first = frame, last = frame }
+        t[slot] = { pc = pc, sig = sig, n = 1, first = frame, last = frame }
     end
 end
 
@@ -399,15 +430,13 @@ handlers.WATCHDUMP = function(a)
     out[#out + 1] = "truncated=" .. tostring(watch_hits > WATCH_MAX)
     for key, t in pairs(watch_log) do
         local rows = {}
-        for pc, e in pairs(t) do
-            rows[#rows + 1] = { pc = pc, n = e.n, first = e.first, last = e.last }
-        end
+        for _, e in pairs(t) do rows[#rows + 1] = e end
         table.sort(rows, function(x, y) return x.n > y.n end)
-        out[#out + 1] = "watch=" .. key .. " distinct_pcs=" .. #rows
+        out[#out + 1] = "watch=" .. key .. " distinct_sites=" .. #rows
         for i = 1, math.min(#rows, top) do
             local r = rows[i]
             out[#out + 1] = "  " .. string.format("0x%08X", r.pc)
-                .. TAB .. r.n .. TAB .. r.first .. TAB .. r.last
+                .. TAB .. r.sig .. TAB .. r.n .. TAB .. r.first .. TAB .. r.last
         end
     end
     return true, table.concat(out, NL)
@@ -424,6 +453,27 @@ handlers.SNAPDUMP = function()
     end
     if #out == 0 then out[#out + 1] = "none" end
     return true, table.concat(out, NL)
+end
+
+handlers.SIGSET = function(a)
+    local addr = tonumber(a[1])
+    if not addr then return false, "SIGSET addr [words]" end
+    sig_addr = addr
+    sig_words = tonumber(a[2]) or 8
+    local s = overlay_sig()
+    if s == false then
+        return false, "cannot read " .. string.format("0x%08X", addr)
+    end
+    return true, sig_label(s)
+end
+
+handlers.SIGCLEAR = function()
+    sig_addr = nil
+    return true, "off"
+end
+
+handlers.SIG = function()
+    return true, sig_label(overlay_sig())
 end
 
 handlers.WATCHCLEAR = function()
