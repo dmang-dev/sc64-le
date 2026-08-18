@@ -1,0 +1,309 @@
+-- sc64 emulator harness -- BizHawk (EmuHawk) side.
+-- Loaded via `EmuHawk.exe <rom> --lua=<this file>`.
+-- Talks to Python over single-writer files in DIR (no sockets, no ports).
+--
+-- Protocol
+--   Python writes  DIR/req_<seq>.tmp   then renames to  DIR/req_<seq>.txt
+--   Lua    writes  DIR/resp_<seq>.tmp  then renames to  DIR/resp_<seq>.txt
+--   Because every filename carries a fresh seq, the rename target never
+--   pre-exists, so os.rename works on Windows and neither side can read a
+--   half-written file.
+-- Request body : CMD \n arg1 \n arg2 ...
+-- Response body: OK \n payload      |  ERR \n message
+
+local DIR = [[@@DIR@@]]
+
+local seq = 1                 -- next request number we expect
+local target_frame = nil      -- set by FRAMES; loop runs until reached
+local pending_seq = nil       -- response owed once target_frame is hit
+local hold_until = nil        -- set by HOLD
+local hold_btns = nil
+local hold_pad = 1
+
+local function path(name) return DIR .. [[\]] .. name end
+
+local function write_file(name, body)
+    local tmp = path(name .. ".tmp")
+    local fh = io.open(tmp, "wb")
+    if not fh then return false end
+    fh:write(body)
+    fh:close()
+    os.rename(tmp, path(name .. ".txt"))
+    return true
+end
+
+local function read_consume(name)
+    local p = path(name .. ".txt")
+    local fh = io.open(p, "rb")
+    if not fh then return nil end
+    local body = fh:read("*a")
+    fh:close()
+    os.remove(p)
+    return body
+end
+
+local function reply(s, ok, payload)
+    write_file("resp_" .. s, (ok and "OK\n" or "ERR\n") .. (payload or ""))
+end
+
+-- ---------------------------------------------------------------- helpers
+
+local HEX = "0123456789abcdef"
+local function tohex(b)
+    return HEX:sub(math.floor(b / 16) + 1, math.floor(b / 16) + 1)
+        .. HEX:sub(b % 16 + 1, b % 16 + 1)
+end
+
+-- Accept either a raw RDRAM offset or a 0x80xxxxxx KSEG0 virtual address.
+-- Returns (address, domain) for the requested domain name.
+local function resolve(addr, domain)
+    domain = domain or "RDRAM"
+    if domain == "RDRAM" and addr >= 0x80000000 then
+        addr = addr - 0x80000000
+    end
+    return addr, domain
+end
+
+local function safe_reg(name)
+    local ok, v = pcall(function() return emu.getregister(name) end)
+    if ok and v ~= nil then return v end
+    return nil
+end
+
+-- Best-effort program counter. Ares64 exposes "PC"; other cores differ, so
+-- probe a few spellings once and remember which one answered.
+local PC_NAME = nil
+local function get_pc()
+    if PC_NAME == nil then
+        for _, n in ipairs({ "PC", "pc", "R_PC", "CPU PC" }) do
+            if safe_reg(n) ~= nil then PC_NAME = n break end
+        end
+        if PC_NAME == nil then PC_NAME = false end
+    end
+    if PC_NAME == false then return nil end
+    local v = safe_reg(PC_NAME)
+    if v == nil then return nil end
+    -- MIPS III PC is 64-bit and comes back signed; fold to the 32-bit
+    -- KSEG0 address the community notes are written in.
+    return math.floor(v) % 0x100000000
+end
+
+-- ---------------------------------------------------------------- commands
+
+local handlers = {}
+
+handlers.PING = function() return true, "pong" end
+
+handlers.INFO = function()
+    local lines = {}
+    local function add(k, v) lines[#lines + 1] = k .. "=" .. tostring(v) end
+    add("bizhawk", client.getversion())
+    add("system", emu.getsystemid())
+    -- BizHawk 2.11 Lua has no "which core" call. Ares64 is a waterbox core
+    -- and is the only N64 core that publishes a "Waterbox PageData" domain,
+    -- so that domain's presence identifies it.
+    local waterbox = false
+    local dl = memory.getmemorydomainlist()
+    for i = 0, #dl do
+        if dl[i] and dl[i]:find("Waterbox") then waterbox = true end
+    end
+    add("core_guess", waterbox and "Ares64" or "Mupen64Plus")
+    add("region", emu.getdisplaytype())
+    add("romhash", gameinfo.getromhash())
+    add("romname", gameinfo.getromname())
+    add("frame", emu.framecount())
+    add("lag", emu.lagcount())
+    add("pcname", tostring(PC_NAME))
+    return true, table.concat(lines, "\n")
+end
+
+handlers.DOMAINS = function()
+    local list = memory.getmemorydomainlist()
+    local out = {}
+    for i = 0, #list do
+        local n = list[i]
+        if n then
+            out[#out + 1] = n .. "\t" .. tostring(memory.getmemorydomainsize(n))
+        end
+    end
+    return true, table.concat(out, "\n")
+end
+
+handlers.REGS = function()
+    local ok, regs = pcall(function() return emu.getregisters() end)
+    if not ok or regs == nil then return false, "core exposes no registers" end
+    local out = {}
+    for k, v in pairs(regs) do out[#out + 1] = tostring(k) .. "=" .. tostring(v) end
+    table.sort(out)
+    return true, table.concat(out, "\n")
+end
+
+handlers.BTNS = function()
+    local out = {}
+    for k, v in pairs(joypad.get(1)) do out[#out + 1] = tostring(k) end
+    table.sort(out)
+    return true, table.concat(out, "\n")
+end
+
+handlers.READ = function(a)
+    local addr = tonumber(a[1])
+    local size = tonumber(a[2])
+    local dom = a[3]
+    if not addr or not size then return false, "READ addr size [domain]" end
+    if size < 1 or size > 65536 then return false, "size out of range" end
+    local ad, dm = resolve(addr, dom)
+    local parts = {}
+    for i = 0, size - 1 do
+        parts[#parts + 1] = tohex(memory.read_u8(ad + i, dm))
+    end
+    return true, table.concat(parts)
+end
+
+handlers.WRITE = function(a)
+    local addr = tonumber(a[1])
+    local hex = a[2] or ""
+    local dom = a[3]
+    if not addr or #hex % 2 ~= 0 then return false, "WRITE addr hex [domain]" end
+    local ad, dm = resolve(addr, dom)
+    local n = #hex // 2          -- integer div: `/` yields a float in Lua 5.4
+    for i = 0, n - 1 do
+        local byte = tonumber(hex:sub(i * 2 + 1, i * 2 + 2), 16)
+        if byte == nil then return false, "bad hex at byte " .. i end
+        memory.write_u8(ad + i, byte, dm)
+    end
+    return true, tostring(n)
+end
+
+handlers.SHOT = function(a)
+    if not a[1] then return false, "SHOT path" end
+    client.screenshot(a[1])
+    return true, a[1]
+end
+
+handlers.STATUS = function()
+    local pc = get_pc()
+    local lines = {
+        "frame=" .. emu.framecount(),
+        "lag=" .. emu.lagcount(),
+        "pc=" .. (pc and string.format("0x%08X", pc) or "unavailable"),
+    }
+    return true, table.concat(lines, "\n")
+end
+
+handlers.SPEED = function(a)
+    local pct = tonumber(a[1])
+    if not pct then return false, "SPEED percent" end
+    client.speedmode(pct)
+    return true, tostring(pct)
+end
+
+-- Not available in BizHawk 2.11.1 (verified: client.invisibleemulation is nil).
+-- Kept so the failure is explicit rather than a stack trace.
+handlers.INVISIBLE = function(a)
+    if type(client.invisibleemulation) ~= "function" then
+        return false, "client.invisibleemulation not present in this BizHawk"
+    end
+    client.invisibleemulation(a[1] == "1")
+    return true, a[1] or "0"
+end
+
+handlers.API = function(a)
+    local t = ({ client = client, emu = emu, memory = memory,
+                 joypad = joypad, savestate = savestate, gameinfo = gameinfo })[a[1]]
+    if not t then return false, "API client|emu|memory|joypad|savestate|gameinfo" end
+    local out = {}
+    for k, v in pairs(t) do out[#out + 1] = tostring(k) .. " (" .. type(v) .. ")" end
+    table.sort(out)
+    return true, table.concat(out, "\n")
+end
+
+handlers.SAVESTATE = function(a)
+    if not a[1] then return false, "SAVESTATE path" end
+    savestate.save(a[1])
+    return true, a[1]
+end
+
+handlers.LOADSTATE = function(a)
+    if not a[1] then return false, "LOADSTATE path" end
+    savestate.load(a[1])
+    return true, a[1]
+end
+
+handlers.QUIT = function()
+    write_file("resp_" .. seq, "OK\nbye")
+    client.exit()
+    return nil
+end
+
+-- FRAMES and HOLD are deferred: they reply only once the frames have elapsed.
+handlers.FRAMES = function(a, s)
+    local n = tonumber(a[1]) or 1
+    target_frame = emu.framecount() + n
+    pending_seq = s
+    return nil                     -- reply later
+end
+
+handlers.HOLD = function(a, s)
+    local n = tonumber(a[1]) or 1
+    hold_btns = {}
+    for btn in (a[2] or ""):gmatch("[^,]+") do hold_btns[btn] = true end
+    hold_pad = tonumber(a[3]) or 1
+    hold_until = emu.framecount() + n
+    target_frame = hold_until
+    pending_seq = s
+    return nil
+end
+
+-- ---------------------------------------------------------------- main loop
+
+local function poll()
+    if pending_seq then return end          -- busy running frames
+    local body = read_consume("req_" .. seq)
+    if not body then return end
+    local args = {}
+    for line in (body .. "\n"):gmatch("([^\n]*)\n") do
+        args[#args + 1] = (line:gsub("\r$", ""))
+    end
+    local cmd = table.remove(args, 1)
+    local h = handlers[cmd]
+    local s = seq
+    seq = seq + 1
+    if not h then reply(s, false, "unknown command: " .. tostring(cmd)) return end
+    local ok, a, b = pcall(h, args, s)
+    if not ok then
+        reply(s, false, tostring(a))
+    elseif a ~= nil then
+        reply(s, a, b)
+    end                                      -- a == nil => deferred
+end
+
+write_file("ready", "1")
+console.log("sc64 harness up; DIR=" .. DIR)
+
+local hb = 0
+while true do
+    poll()
+
+    if hold_until and emu.framecount() < hold_until and hold_btns then
+        joypad.set(hold_btns, hold_pad)
+    end
+
+    if target_frame and emu.framecount() >= target_frame then
+        local s = pending_seq
+        target_frame, pending_seq, hold_until, hold_btns = nil, nil, nil, nil
+        if s then reply(s, true, tostring(emu.framecount())) end
+    end
+
+    hb = hb + 1
+    if hb >= 5 then
+        hb = 0
+        local pc = get_pc()
+        local fh = io.open(path("hb.txt"), "wb")
+        if fh then
+            fh:write(emu.framecount() .. "\n" .. (pc or -1) .. "\n" .. os.time())
+            fh:close()
+        end
+    end
+
+    emu.frameadvance()
+end

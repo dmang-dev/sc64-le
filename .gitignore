@@ -1,0 +1,32 @@
+# Never commit game data. A ROM, a patched ROM, an extracted map or a decoded
+# briefing is Blizzard's or Nintendo's, and this repository is tools only.
+*.z64
+*.n64
+*.v64
+*.rom
+*.scm
+*.scx
+*.chk
+*.mpq
+
+# Build output and working directories
+runs/
+shots/
+menus/
+ladder/
+melee/
+title/
+gamedata/
+*.png
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
