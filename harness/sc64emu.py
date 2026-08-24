@@ -112,6 +112,9 @@ def _patch_n64_hardware(cfg: dict, expansion_pak: bool, controllers: int) -> Non
 # you are watching a run rather than screenshotting it.
 ZOOM = 2                      # 320x240 * 2 = 640x480 video area
 
+# Base config.ini text, read once -- see _patch_config.
+_BASE_CONFIG: str | None = None
+
 
 def _patch_config(dst: Path, core: str = "Ares64", *,
                   expansion_pak: bool = True, controllers: int = 1) -> None:
@@ -119,8 +122,27 @@ def _patch_config(dst: Path, core: str = "Ares64", *,
 
     We never touch the user's own config.ini -- EmuHawk is launched with
     --config pointing at this copy.
+
+    The base config is read once per process and cached. Re-reading it on
+    every boot opened a window where a parallel worker's EmuHawk, saving
+    state on exit, held the file just as another worker's boot read it --
+    intermittent Permission denied under 6-way sweeps. The first read still
+    tolerates a briefly locked file rather than failing the whole run on a
+    2-second collision.
     """
-    cfg = json.loads((BIZHAWK / "config.ini").read_text(encoding="utf-8"))
+    global _BASE_CONFIG
+    if _BASE_CONFIG is None:
+        last = None
+        for _ in range(20):                                # ~2s of patience
+            try:
+                _BASE_CONFIG = (BIZHAWK / "config.ini").read_text(encoding="utf-8")
+                break
+            except PermissionError as exc:
+                last = exc
+                time.sleep(0.1)
+        else:
+            raise EmuError(f"cannot read {BIZHAWK / 'config.ini'}: {last}")
+    cfg = json.loads(_BASE_CONFIG)
     cfg["PreferredCores"]["N64"] = core
     cfg.update({
         # Run as fast as the host allows; frame counts stay deterministic.
@@ -226,12 +248,32 @@ class Emu:
         raise EmuTimeout(f"harness never became ready within {timeout}s")
 
     def close(self):
+        """Shut EmuHawk down and WAIT until it is actually gone.
+
+        Returning while the process is still dying looks harmless and is not:
+        the caller's next move is usually to delete the session's ROM or reuse
+        its directory, and on Windows both fail with Permission denied while
+        EmuHawk still holds the handles. A six-way parallel sweep hit exactly
+        that -- workers finishing in waves, each unlink racing a neighbour's
+        exit -- and every affected boot succeeded on sequential retry, which
+        is the signature of a shutdown race rather than anything in the run.
+        So the contract is: close() does not return until the process is
+        reaped, even on the kill() path, and an unkillable EmuHawk is a loud
+        error rather than a leaked lock.
+        """
         if self.proc and self.proc.poll() is None:
             try:
                 self._send("QUIT")
                 self.proc.wait(timeout=10)
             except Exception:
                 self.proc.kill()
+                try:
+                    self.proc.wait(timeout=10)
+                except Exception:
+                    pass
+        if self.proc and self.proc.poll() is None:
+            raise EmuError("EmuHawk did not exit even after kill(); "
+                           "its session files are still locked")
         self.proc = None
 
     def __enter__(self):
@@ -412,6 +454,32 @@ class Emu:
     def sig(self) -> str:
         """The signature right now, or '-' if unset, 'ERR' if unreadable."""
         return self.cmd("SIG").strip()
+
+    def call_log(self, addr: int, reg: str = "a0") -> str:
+        """Record `reg` at every execution of `addr`, not just the first.
+
+        For a resolver like 0x8002F584, which takes a BOLT resource id in a0,
+        this answers "what did the game ask for, and in what order" -- which
+        is the only way to pair an image with its palette when the pixels
+        cannot tell them apart.
+        """
+        return self.cmd("CALLLOG", addr, reg).strip()
+
+    def call_log_dump(self, top: int = 400) -> dict:
+        """{key: [(value, hits, first_frame, last_frame), ...]} in load order."""
+        out: dict[str, list] = {}
+        cur = None
+        for line in self.cmd("CALLLOGDUMP", top).splitlines():
+            if line.startswith("log="):
+                cur = line.partition("=")[2].split()[0]
+                if cur == "none":
+                    cur = None
+                else:
+                    out[cur] = []
+            elif line.strip() and cur:
+                v, n, first, last = line.split()
+                out[cur].append((int(v, 16), int(n), int(first), int(last)))
+        return out
 
     def watch_clear(self) -> int:
         return int(self.cmd("WATCHCLEAR").strip())
