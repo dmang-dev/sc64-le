@@ -53,6 +53,7 @@ round-trip through their own decoder and hang the console.
 | `ladder_edition.py` | install PC ladder maps into the melee slots and repoint the lists |
 | `inject_map.py` | put one PC map into a BOLT slot, raw or compressed |
 | `patch_scenario.py` | read or edit the melee Scenario list |
+| `grow_directory.py` | grow BOLT directory 008 and build past the 36-map ceiling |
 | `preview_offsets.py` | read or repoint the map-preview arithmetic that caps the melee range at 36 |
 | `loading_screen.py` | replace the "ACCESSING MISSION DATA..." screens with your own art |
 | `title_brand.py` | stamp text onto the title screen |
