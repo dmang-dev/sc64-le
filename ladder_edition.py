@@ -36,6 +36,7 @@ from extract_sc64_maps import (BOLT_ENTRY_SIZE, BOLT_HEADER_SIZE, BoltArchive,
                                chk_sections, load_rom, looks_like_chk,
                                parse_map)
 from inject_map import dir_entry_offset, tail_free_start
+from lzcache import encode_cached
 from pc_maps import read_chk
 from sc64 import find_rom
 
@@ -226,9 +227,7 @@ def main(argv=None) -> int:
         sec = {t: p for t, p in chk_sections(chk)}
         humans = sum(1 for b in sec.get(b"OWNR", b"") if b == 6)
 
-        packed = bolt_lzss.encode(chk, a.level)
-        if bolt_lzss.decode(packed, len(chk)) != chk:
-            sys.exit(f"error: {src.name} failed its compression round trip")
+        packed, _hit = encode_cached(chk, a.level)
 
         # Re-read the archive each time: the previous write moved where the
         # tail padding begins, and the next payload has to land after it.

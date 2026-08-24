@@ -50,6 +50,7 @@ import _deps  # noqa: F401  (puts sc64-maps on sys.path)
 from extract_sc64_maps import (BOLT_ENTRY_SIZE, BOLT_HEADER_SIZE, BoltArchive,
                                chk_sections, load_rom, parse_map)
 from ladder_edition import normalise
+from lzcache import encode_cached, stats
 from pc_maps import read_chk
 from sc64 import find_rom
 
@@ -164,14 +165,14 @@ def main(argv=None) -> int:
         return at - stock.base           # BOLT-relative
 
     map_recs = []
+    hits = 0
     print(f"\ninstalling {n} maps into files {FIRST_MELEE:#05x}.."
           f"{FIRST_MELEE + n - 1:#05x} (indices {MELEE_BASE}..{MELEE_BASE + n - 1})")
     for i, src in enumerate(unique):
         chk, dropped, dupes = normalise(read_chk(src))
         info = parse_map(src.name, chk)
-        packed = bolt_lzss.encode(chk, a.level)
-        if bolt_lzss.decode(packed, len(chk)) != chk:
-            sys.exit(f"error: {src.name} failed its compression round trip")
+        packed, hit = encode_cached(chk, a.level)
+        hits += hit
         off = place(packed)
         template = old[FIRST_MELEE + i] if i < 36 else old[FIRST_MELEE]
         map_recs.append(make_record(template, len(chk), off, True))
@@ -180,6 +181,10 @@ def main(argv=None) -> int:
                   f"{info.width}x{info.height} {len(chk):8,} -> {len(packed):7,}")
         elif i == 3:
             print(f"  ... {n - 5} more ...")
+
+    cached, cached_bytes = stats()
+    print(f"  compression: {hits}/{n} served from cache "
+          f"({cached} entries, {cached_bytes / 1024 / 1024:.1f} MiB)")
 
     # --- assemble the new table ------------------------------------------
     table = []
