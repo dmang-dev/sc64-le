@@ -92,6 +92,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--maps", required=True, help="directory of .scm/.scx maps")
     ap.add_argument("--count", type=int, default=48, help="melee maps to install")
+    ap.add_argument("--skip", action="append", default=[],
+                    help="exclude maps whose filename contains this (repeatable). "
+                         "The next unique map in order takes the vacated place, "
+                         "so the count still comes out at --count")
     ap.add_argument("--rom", default=None)
     ap.add_argument("-o", "--out", default="sc64_grown.z64")
     ap.add_argument("--level", type=int, default=3)
@@ -148,6 +152,13 @@ def main(argv=None) -> int:
             seen.add(key)
             unique.append(src)
     print(f"{len(sources)} files -> {len(unique)} unique scenarios")
+    for pat in a.skip:
+        dropped_maps = [u for u in unique if pat.lower() in u.name.lower()]
+        unique = [u for u in unique if pat.lower() not in u.name.lower()]
+        for d in dropped_maps:
+            print(f"  --skip {pat}: excluding {d.name}")
+        if not dropped_maps:
+            print(f"  --skip {pat}: matched nothing")
     if len(unique) < n:
         sys.exit(f"error: only {len(unique)} unique maps, need {n}")
     unique = unique[:n]
