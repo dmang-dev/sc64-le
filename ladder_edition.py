@@ -181,6 +181,65 @@ def clamp_terrain(chk: bytes) -> tuple[bytes, int]:
     return bytes(out), clamped
 
 
+def convert_strings(chk: bytes) -> tuple[bytes, int]:
+    """Give a map that only has STRx a classic STR section. Returns (chk, n).
+
+    Sixteen of the 2017 ladder maps hang the console with the same loading
+    screen as every other bad map, and the discriminator turned out to be
+    that they have NO 'STR ' section at all -- they carry 'STRx' instead,
+    the extended string table that Remastered-era editors write. PC 1.21+
+    reads STRx; a 1998 cartridge has never heard of it, so the map arrives
+    with no string table the engine can see. All 43 maps that play carry a
+    classic STR; all 16 that carry only STRx hang. That is not protection,
+    just a resave by a modern editor.
+
+    The conversion is mechanical: STRx is u32 count + u32 offsets + string
+    data, STR is the same with u16s. It is only possible while everything
+    fits in 16 bits, which a 4 KB table does with room to spare; a table too
+    big to convert is left alone and reported by the caller's read-back
+    rather than silently truncated. STRx is dropped after conversion so the
+    console sees exactly one string table.
+    """
+    sec = {t: p for t, p in chk_sections(chk)}
+    if b"STR " in sec or b"STRx" not in sec:
+        return chk, 0
+    x = sec[b"STRx"]
+    if len(x) < 4:
+        return chk, 0
+    count = struct.unpack_from("<I", x, 0)[0]
+    if count == 0 or 4 + 4 * count > len(x):
+        return chk, 0
+
+    strings = []
+    for i in range(count):
+        off = struct.unpack_from("<I", x, 4 + 4 * i)[0]
+        end = x.find(b"\0", off) if off < len(x) else -1
+        strings.append(x[off:end] if end >= 0 else b"")
+
+    header = 2 + 2 * count
+    total = header + sum(len(s) + 1 for s in strings)
+    if count > 0xFFFF or total > 0xFFFF:
+        return chk, 0                     # cannot express as STR; leave it
+
+    blob = bytearray(struct.pack("<H", count))
+    offs, cursor = [], header
+    for s in strings:
+        offs.append(cursor)
+        cursor += len(s) + 1
+    for o in offs:
+        blob += struct.pack("<H", o)
+    for s in strings:
+        blob += s + b"\0"
+
+    out = bytearray()
+    for tag, payload in chk_sections(chk):
+        if tag == b"STRx":
+            out += b"STR " + struct.pack("<i", len(blob)) + bytes(blob)
+        else:
+            out += tag + struct.pack("<i", len(payload)) + payload
+    return bytes(out), 1
+
+
 def normalise(chk: bytes) -> tuple[bytes, int, int]:
     """Junk-stripped, duplicate-collapsed, terrain-clamped CHK.
 
@@ -195,6 +254,7 @@ def normalise(chk: bytes) -> tuple[bytes, int, int]:
     chk, dropped = strip_junk(chk)
     chk, dupes = collapse_duplicates(chk)
     chk, _clamped = clamp_terrain(chk)
+    chk, _converted = convert_strings(chk)
     return chk, dropped, dupes
 
 
