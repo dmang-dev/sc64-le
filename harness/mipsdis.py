@@ -35,6 +35,10 @@ OPS = {
     0x14: "beql", 0x15: "bnel", 0x16: "blezl", 0x17: "bgtzl",
     0x20: "lb", 0x21: "lh", 0x23: "lw", 0x24: "lbu", 0x25: "lhu",
     0x28: "sb", 0x29: "sh", 0x2B: "sw",
+    # Unaligned word access. Missing these made two instructions in the
+    # blitter dump print as .word and led to calling a compressed-source
+    # blit path a "decompressor".
+    0x22: "lwl", 0x26: "lwr", 0x2A: "swl", 0x2E: "swr",
     0x31: "lwc1", 0x39: "swc1", 0x37: "ld", 0x3F: "sd",
 }
 
