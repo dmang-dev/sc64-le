@@ -147,17 +147,54 @@ def strip_junk(chk: bytes) -> tuple[bytes, int]:
     return bytes(out), dropped
 
 
-def normalise(chk: bytes) -> tuple[bytes, int, int]:
-    """Junk-stripped, duplicate-collapsed CHK. Returns (chk, dropped, dupes).
+def clamp_terrain(chk: bytes) -> tuple[bytes, int]:
+    """Trim an oversized MTXM to exactly width*height*2. Returns (chk, n).
 
-    The two passes are always wanted together and always in this order --
-    collapsing first would merge duplicates of tags that are about to be
-    thrown away. Every caller that hashes, installs or compares a scenario
-    wants this exact composition, so it lives here rather than being spelled
-    out at each site.
+    Five of the 2017 ladder maps carry an MTXM nine bytes longer than the tile
+    grid -- a protector's signature, the same +9 on every one. PC StarCraft
+    reads width*height tiles and ignores the tail, so it never notices. The
+    console does: the MTXM handler at 0x8002DADC range-checks the section
+    against width*height*2 and an overshoot hangs the load on the "ACCESSING
+    MISSION DATA" screen, indistinguishable from any other failed map.
+
+    strip_junk removes sections the game does not define and collapse_duplicates
+    merges repeats, but neither checks the SIZE of a section it keeps. This does,
+    for MTXM specifically -- the one whose handler is known to reject an
+    oversized section -- and only ever truncates, never pads: an undersized
+    MTXM is a different and unproven problem, left alone.
+
+    Verified end to end: the clamped map loads at an index where its unclamped
+    form hangs.
+    """
+    dim = next((p for t, p in chk_sections(chk) if t == b"DIM "), None)
+    if not dim or len(dim) < 4:
+        return chk, 0
+    w, h = struct.unpack_from("<HH", dim, 0)
+    expect = w * h * 2
+    out = bytearray()
+    clamped = 0
+    for tag, payload in chk_sections(chk):
+        if tag == b"MTXM" and len(payload) > expect:
+            payload = payload[:expect]
+            clamped += 1
+        out += tag + struct.pack("<i", len(payload)) + payload
+    return bytes(out), clamped
+
+
+def normalise(chk: bytes) -> tuple[bytes, int, int]:
+    """Junk-stripped, duplicate-collapsed, terrain-clamped CHK.
+
+    Returns (chk, dropped, dupes). The passes run in this order and always
+    together: strip removes undefined sections, collapse merges repeats (which
+    must come after strip, or it would merge duplicates about to be thrown
+    away), and clamp trims an oversized MTXM to the tile grid (which must come
+    after collapse, since the merged section is the one the console will read).
+    Every caller that hashes, installs or compares a scenario wants this exact
+    composition, so it lives here rather than being spelled out at each site.
     """
     chk, dropped = strip_junk(chk)
     chk, dupes = collapse_duplicates(chk)
+    chk, _clamped = clamp_terrain(chk)
     return chk, dropped, dupes
 
 
