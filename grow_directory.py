@@ -183,6 +183,22 @@ def main(argv=None) -> int:
             print(f"  --skip {pat}: excluding {d.name}")
         if not dropped_maps:
             print(f"  --skip {pat}: matched nothing")
+    # The engine's map-size ceiling is 192x192, established empirically: all
+    # five 256x256 maps in the pool draw their terrain and then hang the core,
+    # while thirteen of fourteen 192x192 maps play (the fourteenth fails for
+    # unrelated reasons). Anything larger is excluded with a reason, up front.
+    fit = []
+    for u in unique:
+        try:
+            info = parse_map(u.name, normalise(read_chk(u))[0])
+        except Exception:
+            continue
+        if info.width > 192 or info.height > 192:
+            print(f"  size guard: excluding {u.name} "
+                  f"({info.width}x{info.height} > 192x192, hangs the engine)")
+        else:
+            fit.append(u)
+    unique = fit
     if len(unique) < n:
         sys.exit(f"error: only {len(unique)} unique maps, need {n}")
     unique = unique[:n]
