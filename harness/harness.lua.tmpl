@@ -353,6 +353,68 @@ local function is_null_id(id)
     return s == ""
 end
 
+local call_log = {}
+local call_ids = {}
+local CALL_MAX = 4096
+
+handlers.CALLLOG = function(a)
+    local addr = tonumber(a[1])
+    local reg = a[2] or "a0"
+    if not addr then return false, "CALLLOG addr [reg]" end
+    local key = string.format("%08X:%s", addr, reg)
+    call_log[key] = {}
+    local t = call_log[key]
+    local n = 0
+    local fn = function()
+        n = n + 1
+        if n > CALL_MAX then return end
+        -- Mupen64Plus splits each 64-bit GPR into <name>_hi / <name>_lo.
+        local v = safe_reg(reg .. "_lo")
+        if v == nil then v = safe_reg(reg) end
+        if v == nil then v = -1 end
+        v = math.floor(v) % 0x100000000
+        local f = emu.framecount()
+        local e = t[v]
+        if e then
+            e.n = e.n + 1
+            e.last = f
+        else
+            t[v] = { n = 1, first = f, last = f }
+        end
+    end
+    local ok, id = pcall(function()
+        return event.onmemoryexecute(fn, addr, key, "System Bus")
+    end)
+    if not ok then return false, "register failed: " .. tostring(id) end
+    if is_null_id(id) then
+        return false, "core returned a null hook id -- this core does not "
+            .. "implement memory callbacks; boot with core=Mupen64Plus"
+    end
+    call_ids[#call_ids + 1] = id
+    return true, key .. " id=" .. tostring(id)
+end
+
+handlers.CALLLOGDUMP = function(a)
+    local top = tonumber(a[1]) or 400
+    local out = {}
+    for key, t in pairs(call_log) do
+        local rows = {}
+        for v, e in pairs(t) do
+            rows[#rows + 1] = { v = v, n = e.n, first = e.first, last = e.last }
+        end
+        -- by first sighting, so the dump reads as the load order
+        table.sort(rows, function(x, y) return x.first < y.first end)
+        out[#out + 1] = "log=" .. key .. " distinct=" .. #rows
+        for i = 1, math.min(#rows, top) do
+            local r = rows[i]
+            out[#out + 1] = "  " .. string.format("0x%08X", r.v)
+                .. TAB .. r.n .. TAB .. r.first .. TAB .. r.last
+        end
+    end
+    if #out == 0 then out[#out + 1] = "log= none" end
+    return true, table.concat(out, NL)
+end
+
 handlers.WATCH = function(a)
     local addr = tonumber(a[1])
     local kind = (a[2] or "read"):lower()

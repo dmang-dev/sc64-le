@@ -137,7 +137,7 @@ map's `VER`.
 
 ### 10.1 The table
 
-At RAM `0x80001644` (file `0x001644`) sits an array of 12-byte records:
+At RAM `0x80001644` (file `0x002244`) sits an array of 12-byte records:
 
 ```
 struct { char tag[4]; void (*handler)(void *data, u32 size); u32 flag; }
