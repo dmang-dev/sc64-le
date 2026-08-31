@@ -240,6 +240,37 @@ def convert_strings(chk: bytes) -> tuple[bytes, int]:
     return bytes(out), 1
 
 
+def ensure_description(chk: bytes) -> tuple[bytes, int]:
+    """Give a map with no description string one. Returns (chk, n_fixed).
+
+    SPRP holds two string indices, name and description, and index 0 means
+    "none". Exactly one map in a 188-map build shipped desc = 0, and it was
+    exactly the map that wedged the console's map selector: scrolling onto it
+    kills the menu (the dispatch loop idles with no handler installed -- the
+    familiar signature) while the same map plays fine when launched directly.
+    Every stock cartridge map carries a description, so the selector's info
+    panel plainly never learned to render "none".
+
+    The repair is two bytes: point the description at the NAME string. The
+    info panel then shows the map's name where the blurb would have been,
+    which is unremarkable, and nothing else changes -- no string table
+    surgery, no size change beyond none at all.
+    """
+    sec = {t: p for t, p in chk_sections(chk)}
+    sprp = sec.get(b"SPRP")
+    if not sprp or len(sprp) < 4:
+        return chk, 0
+    name_i, desc_i = struct.unpack("<HH", sprp[:4])
+    if desc_i != 0 or name_i == 0:
+        return chk, 0
+    out = bytearray()
+    for tag, payload in chk_sections(chk):
+        if tag == b"SPRP":
+            payload = struct.pack("<HH", name_i, name_i) + payload[4:]
+        out += tag + struct.pack("<i", len(payload)) + payload
+    return bytes(out), 1
+
+
 def normalise(chk: bytes) -> tuple[bytes, int, int]:
     """Junk-stripped, duplicate-collapsed, terrain-clamped CHK.
 
@@ -255,6 +286,7 @@ def normalise(chk: bytes) -> tuple[bytes, int, int]:
     chk, dupes = collapse_duplicates(chk)
     chk, _clamped = clamp_terrain(chk)
     chk, _converted = convert_strings(chk)
+    chk, _desc = ensure_description(chk)
     return chk, dropped, dupes
 
 
