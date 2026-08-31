@@ -13,13 +13,26 @@ The 36-map ceiling is three constraints at once, and all three have to go:
      maps, 36 previews, 36 palettes. For N melee maps you need 68 + 3N.
   3. Every new map needs a preview and a palette, or the fetch misses.
 
-This does all three. The directory table is rebuilt at N = 48 -- 212 entries --
-and written into free space, with root entry 8 repointed at it. The layout:
+This does all three, with two layouts chosen automatically by --count.
+
+Up to 62 maps (68 + 3N <= 256), everything fits inside directory 008:
 
     000..043   68 entries, copied verbatim (8 misc + 60 campaign maps)
-    044..073   48 melee maps
-    074..0A3   48 preview images
-    0A4..0D3   48 preview palettes
+    044..      N melee maps, then N preview images, then N preview palettes
+
+Beyond 62 the previews cannot share the directory, and the ceiling moves to
+the id encoding itself: ids are (dir << 8) | file, so the melee range ends at
+file 0xFF -- 188 maps. The big layout gives directory 008 exactly 68 + N
+entries (256 at N = 188, count byte 0 by the format's convention) and puts the
+previews in TWO NEW DIRECTORIES appended to the BOLT root:
+
+    root 23 (017/)   N preview images     reached as map_id + 0xEBC
+    root 24 (018/)   N preview palettes   reached as map_id + 0xFBC
+
+Cross-directory preview offsets are proven to resolve on the engine (see
+preview_offsets.py). The stock root table abuts directory 0's table, so the
+big layout first relocates that table into the expanded half to free the 32
+bytes the two new root records need, then bumps the root count from 23 to 25.
 
 Entry records are just (size, offset) pairs, so the 12 extra previews and
 palettes do not need new artwork: they point at the cartridge's own
@@ -72,6 +85,7 @@ LIST_LEN_OFFSET, LIST_LEN_EXPECT = 0x0DAB78, 0x2406001B
 # placeholder rather than a drawn thumbnail, so its preview and palette are the
 # natural stand-in for maps that have none.
 PLACEHOLDER_INDEX = 93
+FIRST_MAP_ID = 0x808 + MELEE_BASE      # 0x844
 
 
 def records(rom: bytes, arc: BoltArchive, table: int, count: int) -> list[bytes]:
@@ -90,7 +104,9 @@ def make_record(old: bytes, size: int, offset: int, compressed: bool) -> bytes:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--maps", required=True, help="directory of .scm/.scx maps")
+    ap.add_argument("--maps", required=True, action="append",
+                    help="directory of .scm/.scx maps (repeatable; sources are "
+                         "scanned in the order given and deduped across all)")
     ap.add_argument("--count", type=int, default=48, help="melee maps to install")
     ap.add_argument("--skip", action="append", default=[],
                     help="exclude maps whose filename contains this (repeatable). "
@@ -102,9 +118,15 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     n = a.count
-    need = 68 + 3 * n
-    if need > 256:
-        sys.exit(f"error: {n} maps needs {need} entries; a directory holds 256")
+    if n > 188:
+        sys.exit(f"error: {n} maps cannot exist -- ids are (dir << 8) | file, "
+                 "so the melee range itself ends at file 0xFF = 188 maps")
+    # Up to 62 maps, previews and palettes fit inside directory 008 alongside
+    # the maps (68 + 3n entries). Beyond that they cannot, and they move to two
+    # NEW directories appended to the BOLT root -- cross-directory preview
+    # offsets are proven to resolve (see preview_offsets.py).
+    big = 68 + 3 * n > 256
+    need = 68 + n if big else 68 + 3 * n
 
     rom_path = find_rom(a.rom)
     if rom_path is None:
@@ -141,7 +163,9 @@ def main(argv=None) -> int:
     print(f"expanded to {len(rom):,} bytes ({len(rom) // 2**20} MiB)")
 
     # --- pick the maps ---------------------------------------------------
-    sources = sorted(Path(a.maps).glob("**/*.sc*"))
+    sources = []
+    for m in a.maps:
+        sources.extend(sorted(Path(m).glob("**/*.sc*")))
     seen, unique = set(), []
     for src in sources:
         try:
@@ -201,10 +225,11 @@ def main(argv=None) -> int:
     table = []
     table += old[:CAMPAIGN_END]                      # misc + campaign
     table += map_recs                                # n melee maps
-    table += old[old_first_preview:old_first_preview + 36]
-    table += [ph_img] * (n - 36)                     # placeholder previews
-    table += old[old_first_palette:old_first_palette + 36]
-    table += [ph_pal] * (n - 36)                     # placeholder palettes
+    if not big:
+        table += old[old_first_preview:old_first_preview + 36]
+        table += [ph_img] * (n - 36)                 # placeholder previews
+        table += old[old_first_palette:old_first_palette + 36]
+        table += [ph_pal] * (n - 36)                 # placeholder palettes
     assert len(table) == need, f"built {len(table)} entries, wanted {need}"
 
     blob = b"".join(table)
@@ -220,12 +245,54 @@ def main(argv=None) -> int:
     struct.pack_into(">I", rom, at + 4, old_size + cursor - (len(rom) // 2))
     print(f"root entry 8 -> {need} entries at BOLT+{table_off:#x}")
 
+    if big:
+        # The 36 real thumbnails stay usable for the first 36 maps; every map
+        # beyond gets the placeholder pair. Records are (size, offset) pairs,
+        # so duplicating one costs 16 bytes and no artwork.
+        prev_tbl = (old[old_first_preview:old_first_preview + 36]
+                    + [ph_img] * (n - 36))
+        pal_tbl = (old[old_first_palette:old_first_palette + 36]
+                   + [ph_pal] * (n - 36))
+        prev_off = place(b"".join(prev_tbl))
+        pal_off = place(b"".join(pal_tbl))
+
+        # Root entries 23 and 24 must live at base+16+23*16 onward, which is
+        # exactly where directory 0's table sits -- the stock root abuts it.
+        # So directory 0's table moves to the expanded half first, and its
+        # root record is repointed before the new records overwrite its old
+        # home.
+        d0 = root[0]
+        d0_count = d0[3] or 256
+        d0_off = struct.unpack_from(">I", d0, 8)[0]
+        d0_blob = bytes(rom[stock.base + d0_off:
+                            stock.base + d0_off + d0_count * BOLT_ENTRY_SIZE])
+        d0_new = place(d0_blob)
+        struct.pack_into(">I", rom, stock.base + BOLT_HEADER_SIZE + 8, d0_new)
+        print(f"directory 000 table relocated: {d0_count} entries "
+              f"BOLT+{d0_off:#x} -> BOLT+{d0_new:#x}")
+
+        for slot, cnt, off, size in ((23, n, prev_off, n * 3152),
+                                     (24, n, pal_off, n * 518)):
+            rec = bytes([0, 0, 0, cnt & 0xFF]) + struct.pack(">III",
+                                                             size, off, 0)
+            ra = stock.base + BOLT_HEADER_SIZE + slot * BOLT_ENTRY_SIZE
+            rom[ra:ra + BOLT_ENTRY_SIZE] = rec
+        rom[stock.base + 11] = 25                    # root count: 23 -> 25
+        print(f"root grown to 25 directories; previews 017/000.."
+              f"017/{n - 1:03X}, palettes 018/000..018/{n - 1:03X}")
+
     # --- the three constants ---------------------------------------------
+    # In the big layout preview ids live in directories 0x17/0x18, reached
+    # from a map id (0x844 + i) by fixed cross-directory offsets -- proven to
+    # resolve, see preview_offsets.py.
+    img_delta = (0x1700 - FIRST_MAP_ID) if big else n
+    pal_delta = (0x1800 - FIRST_MAP_ID) if big else 2 * n
     wi = struct.unpack_from(">I", rom, IMAGE_SITE)[0]
     wp = struct.unpack_from(">I", rom, PALETTE_SITE)[0]
-    struct.pack_into(">I", rom, IMAGE_SITE, (wi & 0xFFFF0000) | n)
-    struct.pack_into(">I", rom, PALETTE_SITE, (wp & 0xFFFF0000) | (2 * n))
-    print(f"preview arithmetic -> image +{n}, palette +{2 * n}")
+    struct.pack_into(">I", rom, IMAGE_SITE, (wi & 0xFFFF0000) | img_delta)
+    struct.pack_into(">I", rom, PALETTE_SITE, (wp & 0xFFFF0000) | pal_delta)
+    print(f"preview arithmetic -> image +{img_delta} ({img_delta:#x}), "
+          f"palette +{pal_delta} ({pal_delta:#x})")
 
     have = struct.unpack_from(">I", rom, LIST_LEN_OFFSET)[0]
     if have == LIST_LEN_EXPECT:
@@ -255,8 +322,14 @@ def main(argv=None) -> int:
         except Exception:
             print(f"  READ-BACK FAILED: {slot}")
             bad += 1
-    prev = sum(1 for i in range(n) if f"008/{FIRST_MELEE + n + i:03X}" in by)
-    pal = sum(1 for i in range(n) if f"008/{FIRST_MELEE + 2 * n + i:03X}" in by)
+    if big:
+        prev = sum(1 for i in range(n) if f"017/{i:03X}" in by)
+        pal = sum(1 for i in range(n) if f"018/{i:03X}" in by)
+        d0ok = sum(1 for e in by if e.startswith("000/"))
+        print(f"directory 000 still walks {d0ok} entries after relocation")
+    else:
+        prev = sum(1 for i in range(n) if f"008/{FIRST_MELEE + n + i:03X}" in by)
+        pal = sum(1 for i in range(n) if f"008/{FIRST_MELEE + 2 * n + i:03X}" in by)
     print(f"\nread-back: {ok}/{n} maps parse, {prev}/{n} preview slots present, "
           f"{pal}/{n} palette slots present")
     print(f"directory 008 now walks {sum(1 for e in back.entries() if e.path.startswith('008/'))} entries")
