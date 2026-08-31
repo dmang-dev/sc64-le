@@ -34,9 +34,19 @@ exactly the minimum; index 96 therefore asks for image 0x88C, which is preview
 palette 0, and palette 0x8B0, which does not exist at all since directory 008
 ends at 0x0AF.
 
-So more maps needs THREE things, not one: this patch, room in directory 008 for
-N previews and N palettes (68 + 3N entries in total, against the 176 it ships
-with), and a preview built for every new map. This tool only does the first.
+So more maps needs THREE things, not one: this patch, entries for N previews
+and N palettes, and a preview built for every new map. This tool only does the
+first.
+
+The preview entries do NOT have to live in directory 008. Offsets that carry
+the computed id across a directory boundary resolve fine -- verified on the
+engine by patching --images 188 --palettes 189, which makes map 60 fetch
+0x900/0x901 (directory 009's loading screen and its palette): both were served
+and the artwork rendered in the preview box. Since ids are (dir << 8) | file
+and a directory holds 256 entries, the melee range itself caps at 188 maps
+(files 0x44..0xFF); previews and palettes for all 188 can live in two new
+directories appended to the BOLT root, reached with offsets around +0xEBC and
++0xFBC, both comfortably inside the addiu immediate.
 
 Copyright (C) 2026 sc64-le contributors
 SPDX-License-Identifier: GPL-3.0-or-later
