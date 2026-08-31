@@ -303,7 +303,17 @@ class Emu:
         t0 = time.time()
         while True:
             if resp.is_file():
-                body = resp.read_text(encoding="utf-8")
+                # The rename that publishes the response is atomic, but on
+                # Windows a just-renamed file can be briefly held by antivirus
+                # or indexing, and an immediate read raises Permission denied.
+                # It cleared within milliseconds every time it was observed,
+                # so treat it as "not ready yet" rather than an error -- the
+                # surrounding loop and its timeout already handle waiting.
+                try:
+                    body = resp.read_text(encoding="utf-8")
+                except PermissionError:
+                    time.sleep(0.01)
+                    continue
                 resp.unlink(missing_ok=True)
                 status, _, payload = body.partition("\n")
                 if status.strip() != "OK":
