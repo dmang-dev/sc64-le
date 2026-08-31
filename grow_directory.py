@@ -183,25 +183,29 @@ def main(argv=None) -> int:
             print(f"  --skip {pat}: excluding {d.name}")
         if not dropped_maps:
             print(f"  --skip {pat}: matched nothing")
-    # The engine's map-size limit is by AREA, not dimension. Established
-    # empirically across two exhaustive sweeps: every 256x256 map (65,536
-    # tiles) draws its terrain and then hangs the core, while 96x256 and
-    # 256x128 maps (24,576 and 32,768 tiles) play, as do thirteen of the
-    # fourteen 192x192s (36,864). The band between 36,864 and 65,536 -- the
-    # 256x192 shapes -- is untested, and this guard excludes it too until a
-    # probe says otherwise. That over-excludes three shapes proven to work
-    # (per-dimension was this guard's first, wrong criterion), kept for now
-    # so the shipped guard matches the build the release verification swept.
+    # The engine's map-size limit is by AREA, not dimension, and the proven
+    # ceiling is 36,864 tiles (192x192). Established empirically: two
+    # exhaustive sweeps showed 96x256 and 256x128 (24,576 / 32,768 tiles)
+    # play and every 256x256 (65,536) draws its terrain and then hangs the
+    # core. A controlled probe of the in-between band (2026-08-31) then
+    # killed it in both orientations: three 49,152-tile maps -- Nightshade
+    # and Aurora at 256x192, Labyrinth at 192x256 -- each booted alongside
+    # a 192x192 pass control (and, first round, a 256x256 hang control) in
+    # the same rig. Aurora and Labyrinth drew terrain and hung the core
+    # exactly like the 256x256s; Nightshade crashed during the loading
+    # screen. So the transposed shape dies too, the rule really is tile
+    # count, and the guard stops at the last size with evidence on the
+    # passing side.
     fit = []
     for u in unique:
         try:
             info = parse_map(u.name, normalise(read_chk(u))[0])
         except Exception:
             continue
-        if info.width > 192 or info.height > 192:
+        if info.width * info.height > 36864:
             print(f"  size guard: excluding {u.name} "
-                  f"({info.width}x{info.height}; over-192 dimensions beyond "
-                  f"the proven-safe area are excluded, see comment)")
+                  f"({info.width}x{info.height} = {info.width * info.height} "
+                  f"tiles; over the 36,864-tile engine limit, see comment)")
         else:
             fit.append(u)
     unique = fit
