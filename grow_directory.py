@@ -183,10 +183,15 @@ def main(argv=None) -> int:
             print(f"  --skip {pat}: excluding {d.name}")
         if not dropped_maps:
             print(f"  --skip {pat}: matched nothing")
-    # The engine's map-size ceiling is 192x192, established empirically: all
-    # five 256x256 maps in the pool draw their terrain and then hang the core,
-    # while thirteen of fourteen 192x192 maps play (the fourteenth fails for
-    # unrelated reasons). Anything larger is excluded with a reason, up front.
+    # The engine's map-size limit is by AREA, not dimension. Established
+    # empirically across two exhaustive sweeps: every 256x256 map (65,536
+    # tiles) draws its terrain and then hangs the core, while 96x256 and
+    # 256x128 maps (24,576 and 32,768 tiles) play, as do thirteen of the
+    # fourteen 192x192s (36,864). The band between 36,864 and 65,536 -- the
+    # 256x192 shapes -- is untested, and this guard excludes it too until a
+    # probe says otherwise. That over-excludes three shapes proven to work
+    # (per-dimension was this guard's first, wrong criterion), kept for now
+    # so the shipped guard matches the build the release verification swept.
     fit = []
     for u in unique:
         try:
@@ -195,7 +200,8 @@ def main(argv=None) -> int:
             continue
         if info.width > 192 or info.height > 192:
             print(f"  size guard: excluding {u.name} "
-                  f"({info.width}x{info.height} > 192x192, hangs the engine)")
+                  f"({info.width}x{info.height}; over-192 dimensions beyond "
+                  f"the proven-safe area are excluded, see comment)")
         else:
             fit.append(u)
     unique = fit
