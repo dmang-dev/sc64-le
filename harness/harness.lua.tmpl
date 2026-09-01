@@ -90,6 +90,60 @@ local function get_pc()
     return math.floor(v) % 0x100000000
 end
 
+-- The 32-bit low half of a named GPR. Mupen64Plus splits every 64-bit
+-- register into <name>_lo / <name>_hi; Ares64 uses the bare name.
+local function reg32(name)
+    local v = safe_reg(name .. "_lo")
+    if v == nil then v = safe_reg(name) end
+    if v == nil then return nil end
+    return math.floor(v) % 0x100000000
+end
+
+local function signed32(v)
+    if v >= 0x80000000 then return v - 0x100000000 end
+    return v
+end
+
+-- A broad register set worth freezing at a conditional breakpoint: enough
+-- to carry a size argument (a0..a3), a base pointer, the caller (ra), and
+-- the saved-register file the callee will spill.
+local COND_REGS = { "at", "v0", "v1", "a0", "a1", "a2", "a3",
+                    "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7",
+                    "s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7",
+                    "t8", "t9", "gp", "sp", "fp", "ra" }
+
+local function read_gprs()
+    local parts = {}
+    for _, rn in ipairs(COND_REGS) do
+        local v = reg32(rn)
+        if v ~= nil then
+            parts[#parts + 1] = rn .. "=" .. string.format("0x%08X", v)
+        end
+    end
+    return table.concat(parts, ",")
+end
+
+-- Words on the stack that look like return addresses, newest first. A rough
+-- backtrace: MIPS spills ra to the frame, so scanning up from sp catches the
+-- caller chain even without frame-pointer bookkeeping.
+local function stack_returns(sp, n)
+    if sp == nil then return "" end
+    local base = sp
+    if base >= 0x80000000 then base = base - 0x80000000 end
+    local ok, res = pcall(function()
+        local parts = {}
+        for i = 0, (n or 64) - 1 do
+            local w = memory.read_u32_be(base + i * 4, "RDRAM")
+            if w >= 0x80001000 and w < 0x80120000 and (w % 4) == 0 then
+                parts[#parts + 1] = string.format("0x%08X", w)
+            end
+        end
+        return table.concat(parts, " ")
+    end)
+    if ok then return res end
+    return ""
+end
+
 -- ---------------------------------------------------------------- commands
 
 local handlers = {}
@@ -485,6 +539,108 @@ handlers.WATCH = function(a)
     return true, key .. " id=" .. tostring(id)
 end
 
+-- A conditional breakpoint. Arms a watch (exec by default) that evaluates a
+-- predicate on one register at every hit and freezes the full register file
+-- plus a stack backtrace on the FIRST hit that matches. This is what first-
+-- hit snapshots cannot do: catch the one call in twenty-five that passes a
+-- bogus argument. At an exec break on a function's entry, `ra` already names
+-- the caller and `a0..a3` hold its arguments, so the frozen state points
+-- straight at the callsite that computed the bad value.
+local cond = { armed = false, total = 0, matched = 0, snap = nil,
+               reg = nil, op = nil, val = 0 }
+
+handlers.WATCHCOND = function(a)
+    local addr = tonumber(a[1])
+    local reg  = a[2]
+    local op   = (a[3] or "neg"):lower()
+    local val  = tonumber(a[4]) or 0
+    local snap_addr = tonumber(a[5])
+    local snap_len  = tonumber(a[6]) or 0
+    local kind = (a[7] or "exec"):lower()
+    local scope = a[8] or "System Bus"
+    if not addr or not reg then
+        return false, "WATCHCOND addr reg [neg|ge|gt|lt|le|eq|ne|nth] "
+            .. "[value] [snap_addr] [snap_len] [read|write|exec] [scope]"
+    end
+    local regfn = ({ read = event.onmemoryread, write = event.onmemorywrite,
+                     exec = event.onmemoryexecute })[kind]
+    if not regfn then return false, "kind must be read, write or exec" end
+
+    cond = { armed = true, total = 0, matched = 0, snap = nil,
+             reg = reg, op = op, val = val }
+
+    local function matches(rv)
+        if op == "neg" then return signed32(rv) < 0 end
+        if op == "ge"  then return rv >= val end
+        if op == "gt"  then return rv >  val end
+        if op == "lt"  then return rv <  val end
+        if op == "le"  then return rv <= val end
+        if op == "eq"  then return rv == val end
+        if op == "ne"  then return rv ~= val end
+        if op == "nth" then return false end   -- ordinal, handled below
+        return false
+    end
+
+    local fn = function()
+        cond.total = cond.total + 1
+        local rv = reg32(reg)
+        if rv == nil then return end
+        local hit
+        if op == "nth" then hit = (cond.total == val) else hit = matches(rv) end
+        if not hit then return end
+        cond.matched = cond.matched + 1
+        if cond.snap ~= nil then return end
+        local hex = ""
+        if snap_addr and snap_len > 0 then
+            local base = snap_addr
+            if base >= 0x80000000 then base = base - 0x80000000 end
+            local ok, res = pcall(function()
+                local parts = {}
+                for i = 0, snap_len - 1 do
+                    parts[#parts + 1] = tohex(memory.read_u8(base + i, "RDRAM"))
+                end
+                return table.concat(parts)
+            end)
+            if ok then hex = res else hex = "ERR:" .. tostring(res) end
+        end
+        cond.snap = { hitno = cond.total, frame = emu.framecount(),
+                      pc = get_pc() or -1, regval = rv,
+                      regs = read_gprs(),
+                      stack = stack_returns(reg32("sp"), 64), hex = hex }
+    end
+
+    local ok, id = pcall(function() return regfn(fn, addr, "cond", scope) end)
+    if not ok then return false, "register failed: " .. tostring(id) end
+    if is_null_id(id) then
+        return false, "core returned a null hook id -- this core does not "
+            .. "implement memory callbacks; boot with core=Mupen64Plus"
+    end
+    watch_ids[#watch_ids + 1] = id
+    return true, "cond armed reg=" .. reg .. " op=" .. op
+        .. (op == "nth" and (" n=" .. val)
+            or (op ~= "neg" and (" val=" .. string.format("0x%08X", val)) or ""))
+end
+
+handlers.WATCHCONDDUMP = function()
+    if not cond.armed then return true, "armed=false" end
+    local out = { "armed=true", "reg=" .. tostring(cond.reg),
+                  "op=" .. tostring(cond.op),
+                  "total=" .. cond.total, "matched=" .. cond.matched }
+    local s = cond.snap
+    if s then
+        out[#out + 1] = "hitno=" .. s.hitno
+        out[#out + 1] = "frame=" .. s.frame
+        out[#out + 1] = "pc=" .. string.format("0x%08X", s.pc)
+        out[#out + 1] = "regval=" .. string.format("0x%08X", s.regval)
+        out[#out + 1] = "regs=" .. s.regs
+        out[#out + 1] = "stack=" .. s.stack
+        out[#out + 1] = "snap=" .. ((s.hex ~= "") and s.hex or "none")
+    else
+        out[#out + 1] = "snap=none"
+    end
+    return true, table.concat(out, NL)
+end
+
 handlers.WATCHDUMP = function(a)
     local top = tonumber(a[1]) or 64
     local out = {}
@@ -547,6 +703,8 @@ handlers.WATCHCLEAR = function()
     watch_log = {}
     snaps = {}
     watch_hits = 0
+    cond = { armed = false, total = 0, matched = 0, snap = nil,
+             reg = nil, op = nil, val = 0 }
     return true, tostring(n)
 end
 

@@ -400,6 +400,60 @@ class Emu:
             args += [snap_addr, snap_len]
         return self.cmd("WATCH", *args).strip()
 
+    def watch_cond(self, addr: int, reg: str, op: str = "neg",
+                   value: int = 0, *, kind: str = "exec",
+                   snap_addr: int | None = None, snap_len: int = 0,
+                   scope: str = "System Bus") -> str:
+        """A conditional breakpoint: freeze the register file the first time
+        `reg` satisfies `op` at `addr`.
+
+        Ops: neg (reg as signed 32 < 0), ge/gt/lt/le/eq/ne against `value`,
+        or nth (capture the `value`-th hit regardless of register). Unlike
+        `watch`, which photographs the first hit, this catches the one hit in
+        many that carries a bad value -- the negative malloc size, the huge
+        count -- and records ra (the caller at an exec break), every GPR, and
+        a stack backtrace. Mupen64Plus only.
+        """
+        args = [addr, reg, op, value,
+                snap_addr if snap_addr is not None else 0, snap_len,
+                kind, scope]
+        return self.cmd("WATCHCOND", *args).strip()
+
+    def watch_cond_dump(self) -> dict:
+        """The frozen state from the matching hit, or an empty match.
+
+        {'armed', 'reg', 'op', 'total', 'matched', 'hitno', 'frame', 'pc',
+         'regval', 'regs': {name: int}, 'stack': [int], 'data': bytes}.
+        `total` counts every hit, `matched` how many satisfied the predicate,
+        `hitno` which hit was frozen. `stack` is the return-address candidates
+        scanned up from sp, newest first.
+        """
+        out: dict = {"armed": False, "regs": {}, "stack": [], "data": b""}
+        for line in self.cmd("WATCHCONDDUMP").splitlines():
+            k, _, v = line.partition("=")
+            k = k.strip()
+            if k == "armed":
+                out["armed"] = (v == "true")
+            elif k in ("reg", "op"):
+                out[k] = v
+            elif k in ("total", "matched", "hitno", "frame"):
+                out[k] = int(v)
+            elif k in ("pc", "regval"):
+                out[k] = int(v, 16)
+            elif k == "regs":
+                rd = {}
+                for pair in (v.split(",") if v else []):
+                    rk, _, rv = pair.partition("=")
+                    if rk:
+                        rd[rk] = int(rv, 16)
+                out["regs"] = rd
+            elif k == "stack":
+                out["stack"] = [int(x, 16) for x in v.split()] if v else []
+            elif k == "snap":
+                out["data"] = (b"" if v in ("none", "")
+                               or v.startswith("ERR:") else bytes.fromhex(v))
+        return out
+
     def snap_dump(self) -> dict:
         """{key: (frame, pc, addr, bytes)} captured when each watch first fired.
 
