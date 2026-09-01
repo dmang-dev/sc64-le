@@ -88,6 +88,23 @@ PLACEHOLDER_INDEX = 93
 FIRST_MAP_ID = 0x808 + MELEE_BASE      # 0x844
 
 
+class RawChk:
+    """A map source whose CHK bytes are supplied directly, bypassing the MPQ
+    reader. Lets a build install a modified or synthetic scenario -- units
+    stripped, terrain swapped -- so a variant can be tested through the exact
+    same placement path as a real map, instead of a hand-rolled inject that
+    does not reproduce a real build. `.name` mirrors pathlib's for parse_map.
+    """
+    def __init__(self, name: str, chk: bytes):
+        self.name = name
+        self.chk = chk
+
+
+def _read(src) -> bytes:
+    """CHK bytes of a source, whether a map file or a RawChk override."""
+    return src.chk if isinstance(src, RawChk) else read_chk(src)
+
+
 def records(rom: bytes, arc: BoltArchive, table: int, count: int) -> list[bytes]:
     """The raw 16-byte records of a directory table."""
     at = arc.base + table
@@ -115,6 +132,12 @@ def main(argv=None) -> int:
     ap.add_argument("--rom", default=None)
     ap.add_argument("-o", "--out", default="sc64_grown.z64")
     ap.add_argument("--level", type=int, default=3)
+    ap.add_argument("--inject-chk", action="append", default=[],
+                    metavar="NAME=FILE",
+                    help="install a raw scenario.chk from FILE as a map named "
+                         "NAME, ahead of the --maps sources so it takes a low "
+                         "melee index. Repeatable. For testing modified or "
+                         "synthetic maps through the real build path.")
     ap.add_argument("--allow-large", action="store_true",
                     help="include maps larger than 36,864 tiles. The engine "
                          "boots maps up to 256x256, but large maps hang at a "
@@ -170,13 +193,19 @@ def main(argv=None) -> int:
     print(f"expanded to {len(rom):,} bytes ({len(rom) // 2**20} MiB)")
 
     # --- pick the maps ---------------------------------------------------
-    sources = []
+    injected = []
+    for spec in a.inject_chk:
+        name, _, fpath = spec.partition("=")
+        if not name or not fpath:
+            sys.exit(f"error: --inject-chk wants NAME=FILE, got {spec!r}")
+        injected.append(RawChk(name, Path(fpath).read_bytes()))
+    sources = list(injected)          # injected maps take the low indices
     for m in a.maps:
         sources.extend(sorted(Path(m).glob("**/*.sc*")))
     seen, unique = set(), []
     for src in sources:
         try:
-            key = hashlib.sha256(normalise(read_chk(src))[0]).hexdigest()
+            key = hashlib.sha256(normalise(_read(src))[0]).hexdigest()
         except Exception:
             continue
         if key not in seen:
@@ -215,7 +244,7 @@ def main(argv=None) -> int:
     fit, large = [], []
     for u in unique:
         try:
-            info = parse_map(u.name, normalise(read_chk(u))[0])
+            info = parse_map(u.name, normalise(_read(u))[0])
         except Exception:
             continue
         if info.width * info.height > 36864 and not a.allow_large:
@@ -253,7 +282,7 @@ def main(argv=None) -> int:
     print(f"\ninstalling {n} maps into files {FIRST_MELEE:#05x}.."
           f"{FIRST_MELEE + n - 1:#05x} (indices {MELEE_BASE}..{MELEE_BASE + n - 1})")
     for i, src in enumerate(unique):
-        chk, dropped, dupes = normalise(read_chk(src))
+        chk, dropped, dupes = normalise(_read(src))
         info = parse_map(src.name, chk)
         packed, hit = encode_cached(chk, a.level)
         hits += hit
