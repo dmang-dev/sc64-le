@@ -115,6 +115,13 @@ def main(argv=None) -> int:
     ap.add_argument("--rom", default=None)
     ap.add_argument("-o", "--out", default="sc64_grown.z64")
     ap.add_argument("--level", type=int, default=3)
+    ap.add_argument("--allow-large", action="store_true",
+                    help="include maps larger than 36,864 tiles. The engine "
+                         "boots maps up to 256x256, but large maps hang at a "
+                         "high per-map rate (an undiagnosed early-load abort); "
+                         "off by default so a naive build stays bootable. With "
+                         "this on, boot-test the result -- some large maps play "
+                         "and some do not, and size alone does not say which.")
     a = ap.parse_args(argv)
 
     n = a.count
@@ -183,32 +190,48 @@ def main(argv=None) -> int:
             print(f"  --skip {pat}: excluding {d.name}")
         if not dropped_maps:
             print(f"  --skip {pat}: matched nothing")
-    # The engine's map-size limit is by AREA, not dimension, and the proven
-    # ceiling is 36,864 tiles (192x192). Established empirically: two
-    # exhaustive sweeps showed 96x256 and 256x128 (24,576 / 32,768 tiles)
-    # play and every 256x256 (65,536) draws its terrain and then hangs the
-    # core. A controlled probe of the in-between band (2026-08-31) then
-    # killed it in both orientations: three 49,152-tile maps -- Nightshade
-    # and Aurora at 256x192, Labyrinth at 192x256 -- each booted alongside
-    # a 192x192 pass control (and, first round, a 256x256 hang control) in
-    # the same rig. Aurora and Labyrinth drew terrain and hung the core
-    # exactly like the 256x256s; Nightshade crashed during the loading
-    # screen. So the transposed shape dies too, the rule really is tile
-    # count, and the guard stops at the last size with evidence on the
-    # passing side.
-    fit = []
+    # There is NO engine area limit. The "36,864-tile ceiling" this guard
+    # once enforced was an artifact of a compressor bug: bolt-lzss <= 0.2.0
+    # accumulated the dual extension byte, but the cartridge's decoder SETS
+    # it (read off the MIPS at 0x80093bec). A stream carrying two chained
+    # value-duals round-tripped in Python yet decoded to a different
+    # back-reference distance on hardware, overran the map buffer, and hit
+    # the engine's assert. Only the largest maps reach the distances that
+    # trigger a dual chain, so every "oversized map hangs" datum was a
+    # mis-compressed stream, not a size failure. Fixed in bolt-lzss 0.3.0.
+    #
+    # With correct streams the engine boots maps up to 256x256 (65,536
+    # tiles): a 2026-09-01 sweep of twelve large maps played Jungle Rumble
+    # and River Runs Through It (both 256x256) and Nightshade + Labyrinth
+    # (49,152). What kills the other eight is per-map, not size: two
+    # same-size same-tileset siblings split pass/fail, and 49,152 Aurora
+    # dies while 49,152 Nightshade plays. The failure is an early-load
+    # abort (dispatcher idles at 0x80004994) whose cause is still open --
+    # see the undiagnosed-map notes. Large maps hit it often enough that a
+    # naive build should stay small by default, but the bar is a heuristic
+    # against that per-map hazard, NOT an engine limit -- so it is a soft
+    # default (36,864, the size class that is essentially always safe) that
+    # --allow-large lifts, with a warning to boot-test.
+    fit, large = [], []
     for u in unique:
         try:
             info = parse_map(u.name, normalise(read_chk(u))[0])
         except Exception:
             continue
-        if info.width * info.height > 36864:
+        if info.width * info.height > 36864 and not a.allow_large:
             print(f"  size guard: excluding {u.name} "
                   f"({info.width}x{info.height} = {info.width * info.height} "
-                  f"tiles; over the 36,864-tile engine limit, see comment)")
+                  f"tiles; over 36,864 -- a conservative default, not an "
+                  f"engine limit. Pass --allow-large to include and boot-test)")
         else:
+            if info.width * info.height > 36864:
+                large.append(u.name)
             fit.append(u)
     unique = fit
+    if large:
+        print(f"  --allow-large: including {len(large)} map(s) over 36,864 "
+              f"tiles -- the engine supports up to 256x256, but large maps "
+              f"hang at a high per-map rate. BOOT-TEST this build.")
     if len(unique) < n:
         sys.exit(f"error: only {len(unique)} unique maps, need {n}")
     unique = unique[:n]

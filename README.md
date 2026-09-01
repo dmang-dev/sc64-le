@@ -19,7 +19,7 @@ maps; `.gitignore` blocks every ROM and map extension outright.
 git clone https://github.com/dmang-dev/sc64-maps      # the read side
 git clone https://github.com/dmang-dev/sc64-le
 cd sc64-le
-pip install bolt-lzss Pillow                          # bolt-lzss 0.2.0 or later
+pip install "bolt-lzss>=0.3.0" Pillow                 # 0.3.0 fixes the dual-byte bug
 
 python ladder_edition.py --expand --recursive \
     --maps /path/to/StarCraft/Maps/ladder \
@@ -41,8 +41,14 @@ python title_brand.py --rom sc64_ladder_edition.z64 \
 Only `verify_ladder.py` and `harness/` need the last two; the patching tools do
 not touch an emulator. Nothing here has a path baked into it.
 
-**bolt-lzss must be 0.2.0 or later.** Earlier versions emit streams that
-round-trip through their own decoder and hang the console.
+**bolt-lzss must be 0.3.0 or later.** Earlier versions mis-encode the
+dual extension byte: a stream carrying two chained value-duals round-trips
+through their own decoder but decodes to a different back-reference distance
+on the cartridge, overruns the map buffer, and hangs the console. Only the
+largest maps reach the distances that trigger it, which is why it masqueraded
+for a while as a "map too big" size limit (it is not one -- the engine boots
+maps up to 256x256; see [`grow_directory.py`](grow_directory.py)'s size-guard
+comment).
 
 ---
 
