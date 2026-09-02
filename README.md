@@ -63,6 +63,7 @@ comment).
 | `preview_offsets.py` | read or repoint the map-preview arithmetic that caps the melee range at 36 |
 | `loading_screen.py` | replace the "ACCESSING MISSION DATA..." screens with your own art |
 | `obstruction_notice.py` | turn the silent "too many obstructions" hang into a readable on-screen message |
+| `exception_screen.py` | draw the engine's *runtime* error message on screen — any `Error()`, not one baked notice (Ares64 / hardware) |
 | `title_brand.py` | stamp text onto the title screen |
 | `n64crc.py` | detect and repair the N64 boot checksum |
 | `pc_maps.py` | read a PC `.scm`/`.scx`, protected ones included |
@@ -115,7 +116,14 @@ breakpoint, and `grow_directory.py --inject-chk` to boot modified variants):
    trampolines the compiled-out assert handler to show it, so a map that trips
    the limit displays *"too many obstructions — map too complex for StarCraft
    64 — widen corridors, reduce nooks"* instead of hanging. Maps that load are
-   untouched.
+   untouched. [`exception_screen.py`](exception_screen.py) goes one further and
+   draws the engine's *own* runtime string — the full "the map could not be
+   loaded…" text, or any other message `Error()` is handed — by trampolining the
+   stub to a routine that writes the message straight to the framebuffer
+   (upper-cased, word-wrapped, glyphs the 8×8 font lacks dropped). Because it
+   pokes RDRAM directly it shows on the cycle-accurate Ares64 core and on
+   hardware, but not under the Mupen64Plus HLE renderer; a passing map never
+   calls the handler, so it never fires.
 
 2. **Terrain-vertex overflow — a genuine bug, only very intricate maps reach
    it.** The isometric-terrain tracer builds vertex pools counted by a *signed
