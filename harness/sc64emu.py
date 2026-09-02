@@ -85,6 +85,17 @@ N64_SYNC_KEY = "BizHawk.Emulation.Cores.Nintendo.N64.N64"
 N64_SYNC_TYPE = ("BizHawk.Emulation.Cores.Nintendo.N64.N64SyncSettings, "
                  "BizHawk.Emulation.Cores")
 
+# Ares64 stores its own sync settings under a different key and a different
+# shape: one controller-type int per port (2 = standard pad, 0 = unplugged),
+# no Controllers array and no expansion-pak toggle -- it emulates the 8 MB
+# either way. Writing only the Mupen key left Ares64 on its default of a single
+# pad, so two-player maps showed "you must have 2 controllers and an Expansion
+# Pak" instead of loading. This key sets the ports Ares64 actually reads.
+ARES64_SYNC_KEY = "BizHawk.Emulation.Cores.Consoles.Nintendo.Ares64.Ares64"
+ARES64_SYNC_TYPE = ("BizHawk.Emulation.Cores.Consoles.Nintendo.Ares64."
+                    "Ares64+Ares64SyncSettings, BizHawk.Emulation.Cores")
+ARES64_PAD = 2                # standard controller; 0 leaves the port empty
+
 
 def _patch_n64_hardware(cfg: dict, expansion_pak: bool, controllers: int) -> None:
     """Plug in the Expansion Pak and however many controllers are wanted.
@@ -106,6 +117,12 @@ def _patch_n64_hardware(cfg: dict, expansion_pak: bool, controllers: int) -> Non
         pads[i]["IsConnected"] = i < controllers
     s["Controllers"] = pads
     css[N64_SYNC_KEY] = s
+
+    # Ares64's parallel settings, so `controllers` takes effect on that core too.
+    a = css.get(ARES64_SYNC_KEY) or {"$type": ARES64_SYNC_TYPE}
+    for i in range(1, 5):
+        a[f"P{i}Controller"] = ARES64_PAD if i <= controllers else 0
+    css[ARES64_SYNC_KEY] = a
 
 
 # The default is zoom factor 1, a 320x240 video area, which is unreadable when
