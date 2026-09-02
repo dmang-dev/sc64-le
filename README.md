@@ -90,6 +90,48 @@ comment).
   confirm control has not been found. The screen itself works.
 * **Removing the campaign from the menus.**
 
+## Which maps won't load
+
+Map *size* is not the limit — with a correct `bolt-lzss` the engine boots maps
+up to 256×256. But some individual maps still refuse to load, and the cause is
+always the *terrain*, never the size. Three distinct failures, found by tracing
+the map load in the emulator (`harness/`, the `WATCHCOND` conditional
+breakpoint, and `grow_directory.py --inject-chk` to boot modified variants):
+
+1. **"Too many obstructions" — a designed engine limit, not a bug.**
+   StarCraft 64 resolves each terrain tile against the tileset with an 8×7
+   neighbourhood match. A tile it cannot resolve trips a deliberate error
+   handler whose own message reads: *"The map could not be loaded because it had
+   too many obstructions. Try widening corridors and reducing the number of
+   small nooks and crannies to correct the problem."* On the retail console that
+   message never renders — the load simply aborts and the **"ACCESSING MISSION
+   DATA..." screen hangs forever**. Complex island/maze maps (many Brood War
+   256×256s — Cauldron, Continental Divide, Frozen Sea, …) hit it; open maps of
+   the same size do not. There is nothing to patch: the game is refusing the
+   map, and its own advice is to simplify the terrain.
+
+2. **Terrain-vertex overflow — a genuine bug, only very intricate maps reach
+   it.** The isometric-terrain tracer builds vertex pools counted by a *signed
+   16-bit* integer and sizes each reallocation as `sext16(count)·8`. Past 32,767
+   vertices that size goes negative, the allocation fails, and the load aborts.
+   Only terrain with enormous edge complexity (some tournament maps — e.g.
+   "BlockChain SE 2.1") generates that many boundary vertices. Removing doodads
+   does not help: the vertices come from the terrain geometry itself. Fixing it
+   means widening the counter everywhere the engine reads it — a deep change,
+   not attempted.
+
+3. **Unresolvable tile content — bails before allocation.** A few maps (e.g.
+   "Homeworld") abort at the very start of the load, before any allocation.
+   Grafting a good map's terrain onto them loads; grafting theirs onto a good
+   map hangs it — so the cause is their tile data (`MTXM`), not size, units, or
+   strings. The exact tile the resolver chokes on is not yet pinned.
+
+`grow_directory.py` excludes maps over 36,864 tiles by default (a conservative
+hedge, since large maps hit these hazards often) — pass `--allow-large` to
+include them and boot-test, because size alone does not predict which large map
+plays. None of the three is diagnosable from the CHK offline; each was found by
+watching the load run.
+
 ## Reading
 
 `docs/FORMAT.md` covers the melee Scenario list, the CHK section dispatch table,
