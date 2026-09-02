@@ -17,8 +17,7 @@ drawn and the frame has settled (the resolver then spins), so the framebuffer
 is static and safe to write. The routine finds the framebuffer the video
 interface is scanning by walking the live osViContext (the same bss chain
 libultra's retrace handler reads), clears it and blits the message in 16-bit
-white -- upper-casing a-z, dropping glyphs the font lacks, char-wrapping at the
-edge -- then returns. It calls nothing and touches only RAM, so it cannot
+white -- upper-casing a-z, dropping glyphs the font lacks, word-wrapping on spaces -- then returns. It calls nothing and touches only RAM, so it cannot
 re-enter the busy resource system the way the engine's own draw routines would.
 
 Because the pixels go straight to the RDRAM framebuffer, this is what the VI --
@@ -74,7 +73,7 @@ def rom_off(vram: int) -> int:
 # --- a tiny MIPS assembler --------------------------------------------------
 def _i(op, rs, rt, imm): return (op << 26) | (rs << 21) | (rt << 16) | (imm & 0xFFFF)
 def _sp(rs, rt, rd, sh, fn): return (rs << 21) | (rt << 16) | (rd << 11) | (sh << 6) | fn
-ZERO, AT, A1 = 0, 1, 5
+ZERO, AT, V0, V1, A1 = 0, 1, 2, 3, 5
 T0, T1, T2, T3, T4, T5, T6, T7 = 8, 9, 10, 11, 12, 13, 14, 15
 T8, T9, RA = 24, 25, 31
 
@@ -146,9 +145,38 @@ def _blitter() -> bytes:
         # font base, cursor x=t2 y=t3
         lui(T8, FONT_VRAM >> 16), ori(T8, T8, FONT_VRAM & 0xFFFF),
         addiu(T2, ZERO, MARGIN), addiu(T3, ZERO, MARGIN),
-        L("char"),
-        lbu(T4, 0, A1), beq(T4, ZERO, "ret"), addiu(A1, A1, 1),
-        addiu(T5, T4, -10), beq(T5, ZERO, "nl"), nop(),   # explicit newline
+        # --- word-wrap: look at each token; break BEFORE a word that overflows ---
+        L("word"),
+        lbu(T4, 0, A1), beq(T4, ZERO, "ret"), nop(),      # NUL -> done
+        addiu(T5, T4, -10), beq(T5, ZERO, "hnl"), nop(),  # \n -> hard newline
+        addiu(T5, T4, -0x20), bne(T5, ZERO, "meas"), nop(),  # not space -> measure
+        addiu(T2, T2, 9),                                 # space: advance and consume
+        beq(ZERO, ZERO, "word"), addiu(A1, A1, 1),
+        L("hnl"),
+        addiu(A1, A1, 1),                                 # consume the newline
+        addiu(T2, ZERO, MARGIN), addiu(T3, T3, 10),
+        sltiu(T5, T3, FB_H - 9), beq(T5, ZERO, "ret"), nop(),
+        beq(ZERO, ZERO, "word"), nop(),
+        # measure the word: v0 = scan ptr, v1 = char count
+        L("meas"),
+        or_(V0, A1, ZERO), addiu(V1, ZERO, 0),
+        L("ml"),
+        lbu(T5, 0, V0), beq(T5, ZERO, "md"), nop(),
+        addiu(T6, T5, -10), beq(T6, ZERO, "md"), nop(),
+        addiu(T6, T5, -0x20), beq(T6, ZERO, "md"), nop(),
+        addiu(V0, V0, 1), beq(ZERO, ZERO, "ml"), addiu(V1, V1, 1),
+        L("md"),
+        sll(T5, V1, 3), addu(T5, T5, V1),                 # width = count*9
+        addu(T6, T2, T5),                                 # x + width
+        sltiu(T6, T6, FB_W - MARGIN), bne(T6, ZERO, "dw"), nop(),  # fits -> draw
+        addiu(T6, T2, -MARGIN), beq(T6, ZERO, "dw"), nop(),  # at margin -> draw anyway
+        addiu(T2, ZERO, MARGIN), addiu(T3, T3, 10),       # else break before the word
+        sltiu(T5, T3, FB_H - 9), beq(T5, ZERO, "ret"), nop(),
+        # --- draw the word, glyph by glyph ---
+        L("dw"),
+        beq(V1, ZERO, "word"), nop(),                     # word done -> next token
+        lbu(T4, 0, A1), addiu(A1, A1, 1),                 # c = *msg, msg++
+        addiu(V1, V1, -1),                                # count--
         sltiu(T5, T4, 0x61), bne(T5, ZERO, "up"), nop(),  # upper-case a-z
         sltiu(T5, T4, 0x7B), beq(T5, ZERO, "up"), nop(),
         addiu(T4, T4, -0x20),
@@ -171,10 +199,7 @@ def _blitter() -> bytes:
         L("cn"),
         addiu(T1, T1, 1), sltiu(T5, T1, 8), bne(T5, ZERO, "col"), nop(),
         addiu(T7, T7, 1), sltiu(T5, T7, 8), bne(T5, ZERO, "row"), nop(),
-        addiu(T2, T2, 9), sltiu(T5, T2, FB_W - 8), bne(T5, ZERO, "char"), nop(),
-        L("nl"),
-        addiu(T2, ZERO, MARGIN), addiu(T3, T3, 10),
-        sltiu(T5, T3, FB_H - 9), bne(T5, ZERO, "char"), nop(),
+        addiu(T2, T2, 9), beq(ZERO, ZERO, "dw"), nop(),   # advance, next glyph in word
         L("ret"),
         jr(RA), nop(),
     ]
