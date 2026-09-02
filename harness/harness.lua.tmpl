@@ -641,6 +641,52 @@ handlers.WATCHCONDDUMP = function()
     return true, table.concat(out, NL)
 end
 
+-- Every ROM->RAM DMA the game starts. On the N64, a transfer is kicked by
+-- writing PI_WR_LEN (0xA460000C); at that instant PI_DRAM_ADDR (0xA4600000)
+-- holds the RAM destination and PI_CART_ADDR (0xA4600004) the ROM source, so
+-- one write-watch on WR_LEN captures (rom, ram, length) for every overlay and
+-- asset load. This is the map a static splitter has to guess: which ROM bytes
+-- become code at which VRAM. Read via the System Bus domain, which exposes the
+-- PI registers where RDRAM does not.
+local dma_log = {}
+local DMA_MAX = 20000
+
+handlers.DMALOG = function()
+    dma_log = {}
+    local fn = function()
+        if #dma_log >= DMA_MAX then return end
+        local ok, rec = pcall(function()
+            local dram = memory.read_u32_be(0xA4600000, "System Bus")
+            local cart = memory.read_u32_be(0xA4600004, "System Bus")
+            local wrlen = memory.read_u32_be(0xA460000C, "System Bus")
+            return { dram = dram, cart = cart, len = wrlen + 1,
+                     frame = emu.framecount(), pc = get_pc() or -1 }
+        end)
+        if ok and rec then dma_log[#dma_log + 1] = rec end
+    end
+    local ok, id = pcall(function()
+        return event.onmemorywrite(fn, 0xA460000C, "dmalog", "System Bus")
+    end)
+    if not ok then return false, "register failed: " .. tostring(id) end
+    if is_null_id(id) then
+        return false, "core returned a null hook id -- boot with core=Mupen64Plus"
+    end
+    watch_ids[#watch_ids + 1] = id
+    return true, "dma logging armed"
+end
+
+handlers.DMADUMP = function()
+    local out = {}
+    for _, r in ipairs(dma_log) do
+        out[#out + 1] = string.format("%08X", r.cart) .. TAB
+            .. string.format("%08X", r.dram) .. TAB
+            .. r.len .. TAB .. r.frame .. TAB
+            .. string.format("%08X", r.pc)
+    end
+    if #out == 0 then out[#out + 1] = "none" end
+    return true, table.concat(out, NL)
+end
+
 handlers.WATCHDUMP = function(a)
     local top = tonumber(a[1]) or 64
     local out = {}
@@ -705,6 +751,7 @@ handlers.WATCHCLEAR = function()
     watch_hits = 0
     cond = { armed = false, total = 0, matched = 0, snap = nil,
              reg = nil, op = nil, val = 0 }
+    dma_log = {}
     return true, tostring(n)
 end
 

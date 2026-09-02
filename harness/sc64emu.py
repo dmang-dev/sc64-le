@@ -454,6 +454,29 @@ class Emu:
                                or v.startswith("ERR:") else bytes.fromhex(v))
         return out
 
+    def dma_log(self) -> str:
+        """Arm capture of every ROM->RAM DMA the game starts.
+
+        A transfer is kicked by writing PI_WR_LEN; at that instant the PI
+        registers hold the ROM source and RAM destination, so one write-watch
+        records (rom, ram, length) for every overlay and asset load -- the
+        ROM->VRAM map a static splitter otherwise has to guess. Mupen64Plus
+        only. Read it back with dma_dump() after running.
+        """
+        return self.cmd("DMALOG").strip()
+
+    def dma_dump(self) -> list[dict]:
+        """[{rom, ram, length, frame, pc}, ...] in transfer order."""
+        out = []
+        for line in self.cmd("DMADUMP", timeout=60.0).splitlines():
+            if not line.strip() or line.strip() == "none":
+                continue
+            cart, dram, length, frame, pc = line.split("\t")
+            out.append({"rom": int(cart, 16), "ram": int(dram, 16) | 0x80000000,
+                        "length": int(length), "frame": int(frame),
+                        "pc": int(pc, 16)})
+        return out
+
     def snap_dump(self) -> dict:
         """{key: (frame, pc, addr, bytes)} captured when each watch first fired.
 
