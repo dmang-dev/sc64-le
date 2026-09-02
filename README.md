@@ -62,6 +62,7 @@ comment).
 | `grow_directory.py` | grow BOLT directory 008 and build past the 36-map ceiling |
 | `preview_offsets.py` | read or repoint the map-preview arithmetic that caps the melee range at 36 |
 | `loading_screen.py` | replace the "ACCESSING MISSION DATA..." screens with your own art |
+| `obstruction_notice.py` | turn the silent "too many obstructions" hang into a readable on-screen message |
 | `title_brand.py` | stamp text onto the title screen |
 | `n64crc.py` | detect and repair the N64 boot checksum |
 | `pc_maps.py` | read a PC `.scm`/`.scx`, protected ones included |
@@ -107,8 +108,14 @@ breakpoint, and `grow_directory.py --inject-chk` to boot modified variants):
    message never renders — the load simply aborts and the **"ACCESSING MISSION
    DATA..." screen hangs forever**. Complex island/maze maps (many Brood War
    256×256s — Cauldron, Continental Divide, Frozen Sea, …) hit it; open maps of
-   the same size do not. There is nothing to patch: the game is refusing the
-   map, and its own advice is to simplify the terrain.
+   the same size do not. The game is refusing the map, and its own advice is to
+   simplify the terrain — but on retail it does so silently.
+   [`obstruction_notice.py`](obstruction_notice.py) makes the message visible:
+   it installs a notice on a loading-screen slot a melee load never selects and
+   trampolines the compiled-out assert handler to show it, so a map that trips
+   the limit displays *"too many obstructions — map too complex for StarCraft
+   64 — widen corridors, reduce nooks"* instead of hanging. Maps that load are
+   untouched.
 
 2. **Terrain-vertex overflow — a genuine bug, only very intricate maps reach
    it.** The isometric-terrain tracer builds vertex pools counted by a *signed
